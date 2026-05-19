@@ -579,8 +579,29 @@ EOF""",
             # IMPORTANT: Avoid leaking OpenHands' own site-packages into the runtime
             exit_code, output = self.cm.exec_command(
                 container,
-                r"""python3 - << 'EOF'
-file_path = '/opt/openhands-venv/lib/python3.13/site-packages/openhands/runtime/impl/local/local_runtime.py'
+                r"""/opt/openhands-venv/bin/python - << 'EOF'
+import importlib.metadata
+import importlib.util
+from pathlib import Path
+
+spec = importlib.util.find_spec("openhands")
+if spec is None or not spec.submodule_search_locations:
+    print("Could not locate installed openhands package")
+    raise SystemExit(10)
+
+openhands_root = Path(next(iter(spec.submodule_search_locations)))
+file_path = openhands_root / "runtime/impl/local/local_runtime.py"
+try:
+    version = importlib.metadata.version("openhands-ai")
+except Exception:
+    version = "unknown"
+print(f"OpenHands version: {version}")
+print(f"OpenHands package root: {openhands_root}")
+print(f"Patch target: {file_path}")
+
+if not file_path.exists():
+    print(f"OpenHands local runtime file not found: {file_path}")
+    raise SystemExit(3)
 
 with open(file_path, 'r', encoding='utf-8') as f:
     content = f.read()
@@ -623,8 +644,22 @@ EOF""",
             # `sed: unterminated 's' command`.
             self.cm.exec_command(
                 container,
-                r"""python3 - << 'EOF'
-file_path = '/opt/openhands-venv/lib/python3.13/site-packages/openhands/core/main.py'
+                r"""/opt/openhands-venv/bin/python - << 'EOF'
+import importlib.util
+from pathlib import Path
+
+spec = importlib.util.find_spec("openhands")
+if spec is None or not spec.submodule_search_locations:
+    print("Could not locate installed openhands package")
+    raise SystemExit(10)
+
+openhands_root = Path(next(iter(spec.submodule_search_locations)))
+file_path = openhands_root / "core/main.py"
+print(f"Patch target: {file_path}")
+
+if not file_path.exists():
+    print(f"OpenHands main entry file not found: {file_path}")
+    raise SystemExit(3)
 
 prepend_lines = [
     'import sys\n',

@@ -179,14 +179,16 @@ class BaseAgent(ABC):
                 log_file=log_file
             )
             
-            # Source environment and run installation
-            # wokdir is set to /installed-agent to avoid conflicts of uv.lock with the main working directory /testbed
+            # Run installation in a clean shell. Sourcing ~/.bashrc / conda here can
+            # short-circuit non-interactive install scripts before the agent is
+            # actually installed.
             exit_code = self.cm.exec_command_stream(
                 container,
-                "source /installed-agent/install-agent.sh",
+                "bash /installed-agent/install-agent.sh",
                 log_file=log_file,
                 workdir="/installed-agent",
-                timeout=1800  # 30 minutes timeout for installation
+                timeout=1800,  # 30 minutes timeout for installation
+                skip_bashrc=True,
             )
             
             if exit_code != 0:
