@@ -243,6 +243,21 @@ class BaseAgent(ABC):
         """
         return True
 
+    def prepare_run(
+        self,
+        container: Container,
+        instruction: str,
+        log_file: Path,
+    ) -> bool:
+        """
+        Prepare agent execution after pre-run setup and before building the run command.
+
+        Subclasses can use this to copy large task payloads or other runtime
+        artifacts into the container without placing them on the docker exec
+        command line.
+        """
+        return True
+
     def failure_hook(self, container: Container, log_file: Path) -> None:
         """Best-effort hook invoked when agent execution fails.
 
@@ -351,6 +366,10 @@ class BaseAgent(ABC):
             success_pre_run = self.pre_run_hook(container, log_file)
             if not success_pre_run:
                 raise RuntimeError("Pre-run hook failed")
+
+            success_prepare_run = self.prepare_run(container, instruction, log_file)
+            if not success_prepare_run:
+                raise RuntimeError("Run preparation failed")
             
             # Get run command
             run_command = self.get_run_command(instruction)

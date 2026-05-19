@@ -4,14 +4,245 @@ OpenHands agent implementation.
 
 import json
 import re
-import shlex
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Dict, Optional  # noqa: F401
 
 from featurebench.infer.agents.base import BaseAgent
 from featurebench.infer.container import DOCKER_HOST_GATEWAY
 from featurebench.infer.render_infer_log import render_infer_log
+
+
+_OPENHANDS_SDK_RUNNER_SCRIPT = r'''#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import traceback
+from pathlib import Path
+from typing import Any
+
+from pydantic import SecretStr
+
+
+def _truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None or not str(value).strip():
+        return None
+    return str(value).strip()
+
+
+def _event_data(event: Any) -> dict[str, Any]:
+    try:
+        return event.model_dump(mode="json", exclude_none=True)
+    except Exception:
+        return {"repr": repr(event)}
+
+
+def _event_to_trajectory_record(index: int, event: Any) -> dict[str, Any]:
+    data = _event_data(event)
+    event_type = event.__class__.__name__
+    source = data.get("source") or event_type
+
+    if event_type == "SystemPromptEvent":
+        action = "system"
+    elif event_type == "ActionEvent":
+        action = data.get("tool_name") or "action"
+    elif event_type == "MessageEvent":
+        action = "message"
+    elif event_type in {
+        "ObservationEvent",
+        "AgentErrorEvent",
+        "UserRejectObservation",
+        "ConversationErrorEvent",
+    }:
+        action = "error" if data.get("is_error") or data.get("code") else "observe"
+    else:
+        action = event_type
+
+    message = (
+        data.get("message")
+        or data.get("thought")
+        or data.get("content")
+        or data.get("detail")
+        or ""
+    )
+    return {
+        "id": index,
+        "source": source,
+        "message": message,
+        "action": action,
+        "args": data,
+    }
+
+
+def _write_trajectory(path: Path, events: list[Any], status: str) -> None:
+    trajectory = [
+        _event_to_trajectory_record(index, event) for index, event in enumerate(events)
+    ]
+    if status == "finished" and (
+        not trajectory or trajectory[-1].get("action") != "finish"
+    ):
+        trajectory.append(
+            {
+                "id": len(trajectory),
+                "source": "agent",
+                "message": "SDK conversation finished.",
+                "action": "finish",
+                "args": {"status": status},
+            }
+        )
+    elif not trajectory:
+        trajectory.append(
+            {
+                "id": 0,
+                "source": "environment",
+                "message": f"SDK conversation ended with status: {status}",
+                "action": "error",
+                "args": {"status": status},
+            }
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(trajectory, indent=2), encoding="utf-8")
+
+
+def _has_error_code(events: list[Any], code: str) -> bool:
+    for event in events:
+        if _event_data(event).get("code") == code:
+            return True
+    return False
+
+
+def _build_llm() -> Any:
+    from openhands.sdk import LLM
+
+    model = _env("LLM_MODEL")
+    if not model:
+        raise RuntimeError("LLM_MODEL is required for OpenHands SDK runner.")
+
+    kwargs: dict[str, Any] = {"model": model}
+
+    api_key = _env("LLM_API_KEY")
+    if api_key:
+        kwargs["api_key"] = SecretStr(api_key)
+
+    optional_string_fields = {
+        "base_url": "LLM_BASE_URL",
+        "api_version": "LLM_API_VERSION",
+        "reasoning_effort": "LLM_REASONING_EFFORT",
+    }
+    for llm_field, env_name in optional_string_fields.items():
+        value = _env(env_name)
+        if value:
+            kwargs[llm_field] = value
+
+    native_tool_calling = _env("LLM_NATIVE_TOOL_CALLING")
+    if native_tool_calling is not None:
+        kwargs["native_tool_calling"] = _truthy(native_tool_calling)
+
+    log_completions = _env("LLM_LOG_COMPLETIONS")
+    if log_completions is not None:
+        kwargs["log_completions"] = _truthy(log_completions)
+
+    completions_folder = _env("LLM_LOG_COMPLETIONS_FOLDER")
+    if completions_folder:
+        kwargs["log_completions_folder"] = completions_folder
+
+    return LLM(**kwargs)
+
+
+def _build_agent(llm: Any) -> Any:
+    from openhands.sdk import Agent
+    from openhands.tools.preset.default import get_default_tools
+
+    tools = get_default_tools(enable_browser=False)
+    return Agent(
+        llm=llm,
+        tools=tools,
+        system_prompt_kwargs={"cli_mode": True},
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="FeatureBench OpenHands SDK runner")
+    parser.add_argument("--task")
+    parser.add_argument("--task-file")
+    args = parser.parse_args()
+
+    if args.task_file:
+        task = Path(args.task_file).read_text(encoding="utf-8")
+    elif args.task:
+        task = args.task
+    else:
+        raise RuntimeError("Either --task or --task-file is required.")
+
+    trajectory_path = Path(
+        _env("SAVE_TRAJECTORY_PATH") or "/agent-logs/trajectory.json"
+    )
+    events: list[Any] = []
+
+    try:
+        from openhands.sdk import Conversation
+
+        max_iterations_raw = _env("MAX_ITERATIONS") or _env("OPENHANDS_MAX_ITERATIONS")
+        max_iterations = int(max_iterations_raw) if max_iterations_raw else 500
+        workspace = "/testbed" if Path("/testbed").exists() else os.getcwd()
+
+        llm = _build_llm()
+        agent = _build_agent(llm)
+
+        def _record_event(event: Any) -> None:
+            events.append(event)
+
+        conversation = Conversation(
+            agent=agent,
+            workspace=workspace,
+            callbacks=[_record_event],
+            persistence_dir="/agent-logs/sdk-conversation",
+            max_iteration_per_run=max_iterations,
+            visualizer=None,
+            delete_on_close=False,
+        )
+        conversation.send_message(task)
+
+        run_error: Exception | None = None
+        try:
+            conversation.run()
+        except Exception as exc:
+            run_error = exc
+            traceback.print_exc()
+
+        status = getattr(conversation.state.execution_status, "value", None)
+        status = str(status or conversation.state.execution_status).lower()
+        _write_trajectory(trajectory_path, events, status)
+
+        if _has_error_code(events, "MaxIterationsReached"):
+            print("RuntimeError: Agent reached maximum iteration.")
+
+        if run_error is not None:
+            print(f"OpenHands SDK runner failed: {run_error}", file=sys.stderr)
+
+        return 0
+    except Exception:
+        traceback.print_exc()
+        try:
+            _write_trajectory(trajectory_path, events, "error")
+        except Exception:
+            pass
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
 
 
 class OpenHandsAgent(BaseAgent):
@@ -163,13 +394,29 @@ echo 'export LLM_LOG_COMPLETIONS_FOLDER=/agent-logs/completions' >> ~/.bashrc
     
     def get_run_command(self, instruction: str) -> str:
         """Get the command to run OpenHands."""
-        escaped_instruction = shlex.quote(instruction)
+        task_file = "/agent-logs/task.txt"
 
         return (
             "set -o pipefail; "
-            "SANDBOX_VOLUMES=${PWD}:/workspace:rw "
+            "export SANDBOX_VOLUMES=${PWD}:/workspace:rw; "
+            "if [ ! -x /opt/openhands-venv/bin/python ]; then "
+            "echo '/opt/openhands-venv/bin/python not found' >&2; exit 127; "
+            "fi; "
+            "if /opt/openhands-venv/bin/python -c "
+            "\"import importlib.util, sys; "
+            "sys.exit(0 if importlib.util.find_spec('openhands.core.main') else 1)\"; "
+            "then "
             "/opt/openhands-venv/bin/python -m openhands.core.main "
-            f"--config-file /agent-logs/openhands-config.toml --task {escaped_instruction}"
+            f"--config-file /agent-logs/openhands-config.toml --file {task_file}; "
+            "elif /opt/openhands-venv/bin/python -c "
+            "\"import importlib.util, sys; "
+            "sys.exit(0 if importlib.util.find_spec('openhands.sdk') else 1)\"; "
+            "then "
+            f"/opt/openhands-venv/bin/python /agent-logs/openhands-sdk-runner.py --task-file {task_file}; "
+            "else "
+            "echo 'No supported OpenHands entrypoint found: missing openhands.core.main and openhands.sdk' >&2; "
+            "exit 1; "
+            "fi"
         )
     
     def get_env_setup_script(self) -> str:
@@ -232,12 +479,47 @@ echo 'export LLM_LOG_COMPLETIONS_FOLDER=/agent-logs/completions' >> ~/.bashrc
         lines.extend(self._get_proxy_unset_lines())
 
         return "\n".join(lines)
+
+    def prepare_run(self, container, instruction: str, log_file) -> bool:
+        """Copy the task prompt into the container without putting it in argv."""
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", delete=False
+            ) as tmp:
+                tmp.write(instruction)
+                tmp_path = Path(tmp.name)
+
+            self.cm.copy_to_container(container, tmp_path, "/agent-logs/task.txt")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to copy OpenHands task file: {e}")
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"\nERROR: Failed to copy OpenHands task file: {e}\n")
+            return False
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
     
     def pre_run_hook(self, container, log_file) -> bool:
         """
         Create agent logs directory and prepare OpenHands runtime config.
         """
         self.cm.exec_command(container, "mkdir -p /agent-logs", log_file=log_file)
+        runner_marker = "FEATUREBENCH_OPENHANDS_SDK_RUNNER_EOF"
+        self.cm.exec_command(
+            container,
+            (
+                f"cat > /agent-logs/openhands-sdk-runner.py <<'{runner_marker}'\n"
+                f"{_OPENHANDS_SDK_RUNNER_SCRIPT.rstrip()}\n"
+                f"{runner_marker}\n"
+                "chmod +x /agent-logs/openhands-sdk-runner.py"
+            ),
+            log_file=log_file,
+        )
 
         condenser_enabled = (
             str(self.env_vars.get("ENABLE_CONDENSER", "false")).strip().lower()
@@ -283,14 +565,21 @@ EOF""",
 
         llm_model = self._kwargs.get("model") or ""
         llm_model_lower = str(llm_model).strip().lower()
-        is_openhands_0_62_0 = self.venv_name.split("-")[-1] == "0.62.0"
+        openhands_version_label = self.venv_name.replace(
+            "openhands-venv-3.13-", "", 1
+        )
+        is_openhands_0_62_0 = openhands_version_label == "0.62.0"
         is_claude_model = "claude" in llm_model_lower
         is_gemini_model = "gemini" in llm_model_lower
 
-        # IMPORTANT: Avoid leaking OpenHands' own site-packages into the runtime
-        exit_code, output = self.cm.exec_command(
-            container,
-            r"""python3 - << 'EOF'
+        if is_openhands_0_62_0:
+            self.logger.info(
+                "OpenHands==0.62.0 detected, applying PYTHONPATH leakage patch..."
+            )
+            # IMPORTANT: Avoid leaking OpenHands' own site-packages into the runtime
+            exit_code, output = self.cm.exec_command(
+                container,
+                r"""python3 - << 'EOF'
 file_path = '/opt/openhands-venv/lib/python3.13/site-packages/openhands/runtime/impl/local/local_runtime.py'
 
 with open(file_path, 'r', encoding='utf-8') as f:
@@ -321,20 +610,20 @@ del lines[target_idx]
 with open(file_path, 'w', encoding='utf-8') as f:
     f.write("".join(lines))
 EOF""",
-            log_file=log_file,
-        )
-        if exit_code != 0:
-            raise RuntimeError(
-                f"Failed to patch OpenHands local_runtime.py to fix PYTHONPATH leakage (exit_code={exit_code}).\n{output}"
+                log_file=log_file,
             )
+            if exit_code != 0:
+                raise RuntimeError(
+                    f"Failed to patch OpenHands local_runtime.py to fix PYTHONPATH leakage (exit_code={exit_code}).\n{output}"
+                )
 
-        # NOTE: Do not use a multi-line `sed '1i ...'` here.
-        # GNU sed treats the second line as a new command; since it starts with
-        # `sys.path...` it is parsed as an `s` command, causing:
-        # `sed: unterminated 's' command`.
-        self.cm.exec_command(
-            container,
-            r"""python3 - << 'EOF'
+            # NOTE: Do not use a multi-line `sed '1i ...'` here.
+            # GNU sed treats the second line as a new command; since it starts with
+            # `sys.path...` it is parsed as an `s` command, causing:
+            # `sed: unterminated 's' command`.
+            self.cm.exec_command(
+                container,
+                r"""python3 - << 'EOF'
 file_path = '/opt/openhands-venv/lib/python3.13/site-packages/openhands/core/main.py'
 
 prepend_lines = [
@@ -350,8 +639,12 @@ if not original.startswith(prepend_text):
     with open(file_path, 'w', encoding='utf-8') as f:
         f.write(prepend_text + original)
 EOF""",
-            log_file=log_file,
-        )
+                log_file=log_file,
+            )
+        else:
+            self.logger.info(
+                f"Skipping OpenHands PYTHONPATH leakage patch for {openhands_version_label}"
+            )
 
         # Patch llm.py to support Opus 4.5 and Sonnet 4 models (remove top_p when temperature is set)
         patch_support_opus_4_5_and_sonnet_4_script = r'''

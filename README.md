@@ -17,7 +17,7 @@ It provides a unified CLI to run inference, evaluation, and dataset generation.
 
 ## 📰 News
 
-📊 **2026.05.18**: We added **lite split** evaluation results for frontier models including **GPT-5.5, Claude Opus 4.7, DeepSeek-V4, GLM-5.1, Kimi-2.6, MiniMax M2.7**, and more to the leaderboard.
+📊 **2026.05.18**: We added **lite split** evaluation results for frontier models including **GPT-5.5, Claude Opus 4.7, DeepSeek-V4, GLM-5.1, Kimi-2.6, Mimo-V2.5-Pro**, and more to the leaderboard.
 
 🚀 **2026.03.27**: We released the **fast split** containing 100 instances (a subset of full split). These instances require no GPU and are optimized for rapid evaluation. On an Intel Xeon Platinum 8457C with 944GB RAM, the average evaluation time per instance using gold patches is **57.2 seconds**.
 
