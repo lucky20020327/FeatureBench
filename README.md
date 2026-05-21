@@ -7,7 +7,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"></a>
   <a href="https://hub.docker.com/u/libercoders"><img src="https://img.shields.io/badge/DockerHub-Images-blue.svg" alt="DockerHub"></a>
   <a href="https://huggingface.co/datasets/LiberCoders/FeatureBench"><img src="https://img.shields.io/badge/HuggingFace-datasets-yellow.svg" alt="HuggingFace"></a>
-  <a href="https://LiberCoders.github.io/FeatureBench/"><img src="https://img.shields.io/badge/Leaderboard-view-purple.svg" alt="Leaderboard"></a>
+  <a href="https://libercoders.github.io/FeatureBench/leaderboard/"><img src="https://img.shields.io/badge/Leaderboard-view-purple.svg" alt="Leaderboard"></a>
 </p>
 
 ---
@@ -22,6 +22,39 @@ It provides a unified CLI to run inference, evaluation, and dataset generation.
 🚀 **2026.03.27**: We released the **fast split** containing 100 instances (a subset of full split). These instances require no GPU and are optimized for rapid evaluation. On an Intel Xeon Platinum 8457C with 944GB RAM, the average evaluation time per instance using gold patches is **57.2 seconds**.
 
 🎁 **2026.02.06**: We now support one-click inference for mainstream agent frameworks, including **OpenHands, Claude Code, Codex, Gemini CLI, and mini-swe-agent**. All supported agent frameworks can be found [here](featurebench/infer/agents/). We have also open-sourced the FeatureBench **data pipeline**.
+
+<!-- LEADERBOARD_START -->
+## 🏆 Leaderboard
+
+[Full interactive leaderboard](https://libercoders.github.io/FeatureBench/leaderboard/) with tabs, filters, and sorting.
+
+<details open>
+<summary><b>Lite split results, ranked by %PASSED</b></summary>
+
+| Rank | Model | Scaffold | %PASSED | %RESOLVED | Date | Site |
+|---:|---|---|---:|---:|---|---|
+| 1 | Claude Opus 4.7 | OpenHands | 78.2 | 46.7 | 2026-05-15 | [link](https://github.com/OpenHands/OpenHands) |
+| 2 | GPT-5.5 | OpenHands | 69.8 | 26.7 | 2026-05-14 | [link](https://github.com/OpenHands/OpenHands) |
+| 3 | Claude Opus 4.6 | OpenHands | 69.5 | 20 | 2026-05-15 | [link](https://github.com/OpenHands/OpenHands) |
+| 4 | Claude Opus 4.5 | OpenHands | 67.2 | 20 | 2026-01-21 | [link](https://github.com/OpenHands/OpenHands) |
+| 5 | GPT-5.4 | OpenHands | 66.2 | 23.3 | 2026-05-14 | [link](https://github.com/OpenHands/OpenHands) |
+| 6 | GPT-5.1-Codex | Codex | 60.2 | 20 | 2026-01-21 | [link](https://chatgpt.com/) |
+| 7 | DeepSeek-V4-Pro | OpenHands | 59.6 | 26.7 | 2026-05-17 | [link](https://github.com/OpenHands/OpenHands) |
+| 8 | Claude Opus 4.5 | Claude Code (routing) | 59.1 | 20 | 2026-01-21 | [link](https://www.anthropic.com/) |
+| 9 | Kimi-2.6 | OpenHands | 49.4 | 20 | 2026-05-18 | [link](https://github.com/OpenHands/OpenHands) |
+| 10 | Mimo-V2.5-Pro | OpenHands | 47.8 | 13.3 | 2026-05-19 | [link](https://github.com/OpenHands/OpenHands) |
+| 11 | Gemini-3-Pro-Preview | OpenHands | 45.1 | 10 | 2026-01-21 | [link](https://github.com/OpenHands/OpenHands) |
+| 12 | GLM-5.1 | OpenHands | 44.2 | 13.3 | 2026-05-18 | [link](https://github.com/OpenHands/OpenHands) |
+| 13 | Gemini-3-Pro-Preview | Gemini-CLI | 43.4 | 10 | 2026-01-21 | [link](https://gemini.google.com/app) |
+| 14 | DeepSeek-V4-Flash | OpenHands | 41.9 | 16.7 | 2026-05-11 | [link](https://github.com/OpenHands/OpenHands) |
+| 15 | MiniMax M2.1 | Mini-SWE-Agent | 41.9 | 10 | 2026-02-14 | [link](https://www.minimaxi.com/) |
+| 16 | GLM 4.7 | Mini-SWE-Agent | 41.2 | 6.7 | 2026-02-14 | [link](https://www.zhipuai.cn/en) |
+| 17 | Qwen3-Coder-480B-A35B-Instruct | OpenHands | 38.3 | 6.7 | 2026-01-21 | [link](https://github.com/OpenHands/OpenHands) |
+| 18 | DeepSeek V3.2 | OpenHands (mock) | 35.9 | 6.7 | 2026-01-21 | [link](https://github.com/OpenHands/OpenHands) |
+| 19 | Qwen3-Coder-30B-A3B-Instruct | OpenHands | 23 | 3.3 | 2026-01-21 | [link](https://github.com/OpenHands/OpenHands) |
+
+</details>
+<!-- LEADERBOARD_END -->
 
 ## 🚀 Quickstart
 
