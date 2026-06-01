@@ -39,6 +39,77 @@ def _env(name: str) -> str | None:
     return str(value).strip()
 
 
+def _install_send_reasoning_content_override(model: str) -> None:
+    """Force OpenHands SDK to preserve/send reasoning content for this model."""
+    try:
+        from openhands.sdk.llm.utils import model_features
+
+        tokens = [model]
+        if "/" in model:
+            tokens.append(model.split("/", 1)[-1])
+        for token in tokens:
+            if token and token not in model_features.SEND_REASONING_CONTENT_MODELS:
+                model_features.SEND_REASONING_CONTENT_MODELS.append(token)
+
+        cache_clear = getattr(model_features.get_features, "cache_clear", None)
+        if cache_clear:
+            cache_clear()
+    except Exception as exc:
+        print(
+            f"Warning: failed to enable reasoning-content send override: {exc}",
+            file=sys.stderr,
+        )
+
+    try:
+        from openhands.sdk.llm.message import Message
+
+        if getattr(Message, "_featurebench_reasoning_alias_patch", False):
+            return
+
+        original = Message.from_llm_chat_message.__func__
+
+        class _ReasoningContentProxy:
+            def __init__(self, wrapped: Any, reasoning_content: str):
+                self._wrapped = wrapped
+                self.reasoning_content = reasoning_content
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._wrapped, name)
+
+        def _extract_reasoning_content(message: Any) -> str | None:
+            reasoning = getattr(message, "reasoning_content", None)
+            if reasoning:
+                return str(reasoning)
+
+            reasoning = getattr(message, "reasoning", None)
+            if reasoning:
+                return str(reasoning)
+
+            provider_fields = getattr(message, "provider_specific_fields", None)
+            if isinstance(provider_fields, dict):
+                for key in ("reasoning_content", "reasoning"):
+                    reasoning = provider_fields.get(key)
+                    if reasoning:
+                        return str(reasoning)
+
+            return None
+
+        def patched(cls: type[Message], message: Any) -> Message:
+            if getattr(message, "reasoning_content", None) is None:
+                reasoning_content = _extract_reasoning_content(message)
+                if reasoning_content:
+                    message = _ReasoningContentProxy(message, reasoning_content)
+            return original(cls, message)
+
+        Message.from_llm_chat_message = classmethod(patched)
+        setattr(Message, "_featurebench_reasoning_alias_patch", True)
+    except Exception as exc:
+        print(
+            f"Warning: failed to install reasoning field alias patch: {exc}",
+            file=sys.stderr,
+        )
+
+
 def _event_data(event: Any) -> dict[str, Any]:
     try:
         return event.model_dump(mode="json", exclude_none=True)
@@ -127,6 +198,9 @@ def _build_llm() -> Any:
     model = _env("LLM_MODEL")
     if not model:
         raise RuntimeError("LLM_MODEL is required for OpenHands SDK runner.")
+
+    if _truthy(_env("LLM_SEND_REASONING_CONTENT")):
+        _install_send_reasoning_content_override(model)
 
     kwargs: dict[str, Any] = {"model": model}
 
@@ -287,18 +361,8 @@ mkdir -p "$CACHE_ROOT" "$CACHE_ROOT/uv" "$CACHE_ROOT/pip" "$CACHE_ROOT/uv/python
 
 export PIP_CACHE_DIR="$CACHE_ROOT/pip"
 export UV_CACHE_DIR="$CACHE_ROOT/uv"
-
-# If a local uv Python mirror exists and is non-empty, use it. Otherwise, let uv download Python from the default upstream sources.
 UV_PYTHON_MIRROR_DIR="$CACHE_ROOT/uv/python-mirror"
-if [ -z "${{UV_PYTHON_INSTALL_MIRROR:-}}" ]; then
-    if [ -d "$UV_PYTHON_MIRROR_DIR" ] && [ "$(ls -A "$UV_PYTHON_MIRROR_DIR" 2>/dev/null)" ]; then
-        export UV_PYTHON_INSTALL_MIRROR="file://$UV_PYTHON_MIRROR_DIR"
-        echo "Using local uv python mirror: $UV_PYTHON_INSTALL_MIRROR"
-    else
-        unset UV_PYTHON_INSTALL_MIRROR
-        echo "Local uv python mirror is empty; using upstream python downloads"
-    fi
-fi
+PYTHON_INSTALL_MIRROR="${{UV_PYTHON_INSTALL_MIRROR:-https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download}}"
 
 UV_DIR="/opt/featurebench/uv"
 UV_BIN_PRIMARY="$UV_DIR/bin/uv"
@@ -338,8 +402,8 @@ source "$UV_DIR/env" 2>/dev/null || true
 
 # Configure uv index mirror (TUNA)
 mkdir -p ~/.config/uv
-cat > ~/.config/uv/uv.toml <<'EOF'
-python-install-mirror = "https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download"
+cat > ~/.config/uv/uv.toml <<EOF
+python-install-mirror = "$PYTHON_INSTALL_MIRROR"
 [[index]]
 url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/"
 default = true
@@ -356,7 +420,54 @@ uv_pip_install_with_fallback() {{
     "$UV_BIN" pip install --index-url "$FALLBACK_INDEX_URL" "$@"
 }}
 
-# Install Python via uv (downloads cached via UV_CACHE_DIR)
+cache_uv_python_download() {{
+    if [[ "$PYTHON_INSTALL_MIRROR" == file://* ]]; then
+        export UV_PYTHON_INSTALL_MIRROR="$PYTHON_INSTALL_MIRROR"
+        echo "Using configured uv python mirror: $UV_PYTHON_INSTALL_MIRROR"
+        return 0
+    fi
+
+    local download_url rel_path target_path part_path
+    download_url="$("$UV_BIN" python list "$PY_VERSION" --only-downloads --show-urls | awk 'NR == 1 {{print $2}}')"
+    if [ -z "$download_url" ] || [[ "$download_url" == "<"* ]]; then
+        echo "Unable to resolve uv Python download URL for $PY_VERSION" >&2
+        return 1
+    fi
+    if [[ "$download_url" != "$PYTHON_INSTALL_MIRROR/"* ]]; then
+        echo "Resolved uv Python URL does not use configured mirror: $download_url" >&2
+        return 1
+    fi
+
+    rel_path="${{download_url#"$PYTHON_INSTALL_MIRROR"/}}"
+    rel_path="${{rel_path//%2B/+}}"
+    rel_path="${{rel_path//%2b/+}}"
+    target_path="$UV_PYTHON_MIRROR_DIR/$rel_path"
+    part_path="$target_path.part"
+
+    mkdir -p "$(dirname "$target_path")"
+    if [ -s "$target_path" ] && tar -tzf "$target_path" >/dev/null 2>&1; then
+        echo "Using cached uv Python archive: $target_path"
+    else
+        if [ -s "$target_path" ]; then
+            echo "Cached uv Python archive is invalid; redownloading: $target_path" >&2
+            rm -f "$target_path"
+        fi
+        echo "Caching uv Python archive: $download_url -> $target_path"
+        curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -C - -o "$part_path" "$download_url"
+        if ! tar -tzf "$part_path" >/dev/null 2>&1; then
+            echo "Downloaded uv Python archive is invalid: $part_path" >&2
+            rm -f "$part_path"
+            return 1
+        fi
+        mv "$part_path" "$target_path"
+    fi
+
+    export UV_PYTHON_INSTALL_MIRROR="file://$UV_PYTHON_MIRROR_DIR"
+    echo "Using local uv python mirror: $UV_PYTHON_INSTALL_MIRROR"
+}}
+
+# Install Python via uv. The archive is cached in a local mirror first so future containers reuse it.
+cache_uv_python_download
 $UV_BIN python install $PY_VERSION
 
 # Create venv (container-local)
@@ -402,7 +513,13 @@ echo 'export LLM_LOG_COMPLETIONS_FOLDER=/agent-logs/completions' >> ~/.bashrc
             "if [ ! -x /opt/openhands-venv/bin/python ]; then "
             "echo '/opt/openhands-venv/bin/python not found' >&2; exit 127; "
             "fi; "
-            "if /opt/openhands-venv/bin/python -c "
+            "if [[ \"${LLM_SEND_REASONING_CONTENT,,}\" =~ ^(1|true|yes|on)$ ]] && "
+            "/opt/openhands-venv/bin/python -c "
+            "\"import importlib.util, sys; "
+            "sys.exit(0 if importlib.util.find_spec('openhands.sdk') else 1)\"; "
+            "then "
+            f"/opt/openhands-venv/bin/python /agent-logs/openhands-sdk-runner.py --task-file {task_file}; "
+            "elif /opt/openhands-venv/bin/python -c "
             "\"import importlib.util, sys; "
             "sys.exit(0 if importlib.util.find_spec('openhands.core.main') else 1)\"; "
             "then "
@@ -445,6 +562,8 @@ echo 'export LLM_LOG_COMPLETIONS_FOLDER=/agent-logs/completions' >> ~/.bashrc
             "LLM_REASONING_EFFORT": self.env_vars.get("LLM_REASONING_EFFORT"),
             # Force native tool calling (OpenHands LLMConfig.native_tool_calling via LLM_ env mapping)
             "LLM_NATIVE_TOOL_CALLING": self.env_vars.get("LLM_NATIVE_TOOL_CALLING"),
+            # Force OpenHands SDK to send prior assistant reasoning_content in history.
+            "LLM_SEND_REASONING_CONTENT": self.env_vars.get("LLM_SEND_REASONING_CONTENT"),
             # Disable features not needed for FeatureBench
             "AGENT_ENABLE_PROMPT_EXTENSIONS": "false",
             "AGENT_ENABLE_BROWSING": "false",

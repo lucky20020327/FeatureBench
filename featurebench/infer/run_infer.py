@@ -338,6 +338,9 @@ class InferenceRunner:
                 # Avoid inheriting config/env values when not forcing.
                 self.agent_env_vars.pop("LLM_NATIVE_TOOL_CALLING", None)
 
+            if getattr(config, "send_reasoning_content", False):
+                self.agent_env_vars["LLM_SEND_REASONING_CONTENT"] = "true"
+
         # Surface force-timeout behavior to all agents via env.
         if getattr(config, "force_timeout", False):
             self.agent_env_vars["FB_FORCE_TIMEOUT"] = "true"
@@ -364,6 +367,12 @@ class InferenceRunner:
                     self.agent_env_vars["LLM_NATIVE_TOOL_CALLING"] = "true"
                 else:
                     self.agent_env_vars.pop("LLM_NATIVE_TOOL_CALLING", None)
+
+                send_reasoning = bool(metadata.get("send_reasoning_content"))
+                if send_reasoning:
+                    self.agent_env_vars["LLM_SEND_REASONING_CONTENT"] = "true"
+                else:
+                    self.agent_env_vars.pop("LLM_SEND_REASONING_CONTENT", None)
 
                 recorded = metadata.get("openhands_reasoning_effort")
                 if recorded is not None and str(recorded).strip():
@@ -778,10 +787,14 @@ class InferenceRunner:
         # Persist the *effective* reasoning effort used by the agent (if any).
         openhands_reasoning_effort: Optional[str] = None
         codex_reasoning_effort: Optional[str] = None
+        send_reasoning_content = False
         if self.config.agent == "openhands":
             raw = self.agent_env_vars.get("LLM_REASONING_EFFORT")
             if raw is not None and str(raw).strip():
                 openhands_reasoning_effort = str(raw).strip()
+            send_reasoning_content = str(
+                self.agent_env_vars.get("LLM_SEND_REASONING_CONTENT", "")
+            ).strip().lower() in {"1", "true", "yes", "on"}
         elif self.config.agent == "codex":
             raw = self.agent_env_vars.get("CODEX_REASONING_EFFORT")
             if raw is not None and str(raw).strip():
@@ -808,6 +821,7 @@ class InferenceRunner:
             without_interface_descriptions=self.config.without_interface_descriptions,
             white_box=getattr(self.config, "white_box", False),
             force_native_tool_calling=getattr(self.config, "force_native_tool_calling", False),
+            send_reasoning_content=send_reasoning_content,
             force_timeout=getattr(self.config, "force_timeout", False),
             api_key=self.config.api_key,
             base_url=self.config.base_url,
@@ -849,6 +863,11 @@ class InferenceRunner:
         if self.config.agent == "openhands":
             if getattr(self.config, "force_native_tool_calling", False):
                 self.console.print("[white]Tool calling:[/] [yellow]forced native[/]")
+            send_reasoning_content = str(
+                self.agent_env_vars.get("LLM_SEND_REASONING_CONTENT", "")
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if send_reasoning_content:
+                self.console.print("[white]Reasoning content:[/] [yellow]send in history[/]")
             effective = self.agent_env_vars.get("OPENHANDS_MAX_ITERATIONS")
             if effective is not None and str(effective).strip():
                 self.console.print(f"[white]Max iters:[/] [green]{effective}[/]")
@@ -1254,6 +1273,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--send-reasoning-content",
+        action="store_true",
+        help=(
+            "OpenHands only: send prior assistant reasoning_content back to the model in subsequent requests. "
+            "Useful for thinking models whose chat template supports reasoning history. "
+            "In --resume mode, this flag is ignored and the value from run_metadata.json is used."
+        ),
+    )
+
+    parser.add_argument(
         "--max-iters",
         type=int,
         default=None,
@@ -1364,6 +1393,10 @@ def load_resume_config(resume_dir: Path, args: argparse.Namespace) -> Tuple[Infe
         warnings.append(
             "--native-tool-calling (using 'force_native_tool_calling' from metadata)"
         )
+    if getattr(args, "send_reasoning_content", False):
+        warnings.append(
+            "--send-reasoning-content (using 'send_reasoning_content' from metadata)"
+        )
     
     if warnings:
         console.print("[bold yellow]Warning: The following arguments are ignored in resume mode:[/]")
@@ -1430,6 +1463,9 @@ def load_resume_config(resume_dir: Path, args: argparse.Namespace) -> Tuple[Infe
     # Determine force_native_tool_calling: always use metadata in resume mode.
     force_native_tool_calling = bool(metadata.get("force_native_tool_calling"))
 
+    # Determine send_reasoning_content: always use metadata in resume mode.
+    send_reasoning_content = bool(metadata.get("send_reasoning_content"))
+
     # Determine api_key/base_url/version: CLI overrides; otherwise use metadata.
     metadata_api_key = metadata.get("api_key")
     api_key = args.api_key if args.api_key is not None else metadata_api_key
@@ -1457,6 +1493,7 @@ def load_resume_config(resume_dir: Path, args: argparse.Namespace) -> Tuple[Infe
         without_interface_descriptions=without_interface_descriptions,
         white_box=white_box,
         force_native_tool_calling=force_native_tool_calling,
+        send_reasoning_content=send_reasoning_content,
         force_timeout=force_timeout,
         force_rerun_ids=_load_force_rerun_ids(getattr(args, "force_rerun", None)),
         api_key=api_key,
@@ -1522,6 +1559,7 @@ def main():
             without_interface_descriptions=bool(getattr(args, "without", False)),
             white_box=bool(getattr(args, "white", False)),
             force_native_tool_calling=bool(getattr(args, "native_tool_calling", False)),
+            send_reasoning_content=bool(getattr(args, "send_reasoning_content", False)),
             force_timeout=bool(getattr(args, "force_timeout", False)),
             force_rerun_ids=_load_force_rerun_ids(getattr(args, "force_rerun", None)),
             api_key=args.api_key,

@@ -131,6 +131,11 @@ flags can override metadata (see the argument list below).
   Force native tool calling (`LLM_NATIVE_TOOL_CALLING=true`).  
   Resume mode: ignored (uses metadata).
 
+- `--send-reasoning-content`  
+  Send prior assistant `reasoning_content` back to the model in subsequent OpenHands requests.  
+  Useful for thinking models whose chat template supports reasoning history.  
+  Resume mode: ignored (uses metadata).
+
 - `--max-iters`  
   Maximum iterations for OpenHands (`OPENHANDS_MAX_ITERATIONS`).  
   Default: no override (OpenHands default applies).  

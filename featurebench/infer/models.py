@@ -170,6 +170,8 @@ class InferConfig:
     white_box: bool = False
     # If True, force OpenHands to use native tool calling (LLM_NATIVE_TOOL_CALLING=true).
     force_native_tool_calling: bool = False
+    # If True, send prior assistant reasoning content back to OpenHands LLM requests.
+    send_reasoning_content: bool = False
     # Optional task IDs to force rerun even if completed.
     force_rerun_ids: Optional[List[str]] = None
     # If True, treat prior TIMEOUT attempts as completed when resuming (skip reruns).
@@ -199,6 +201,7 @@ class InferConfig:
             "without_interface_descriptions": self.without_interface_descriptions,
             "white_box": self.white_box,
             "force_native_tool_calling": self.force_native_tool_calling,
+            "send_reasoning_content": self.send_reasoning_content,
             "force_rerun_ids": self.force_rerun_ids,
             "force_timeout": self.force_timeout,
             "api_key": self.api_key,
@@ -260,6 +263,7 @@ class RunMetadata:
     without_interface_descriptions: bool = False
     white_box: bool = False
     force_native_tool_calling: bool = False
+    send_reasoning_content: bool = False
     force_timeout: bool = False
     api_key: Optional[str] = None
     base_url: Optional[str] = None
@@ -289,6 +293,7 @@ class RunMetadata:
             "without_interface_descriptions": self.without_interface_descriptions,
             "white_box": self.white_box,
             "force_native_tool_calling": self.force_native_tool_calling,
+            "send_reasoning_content": self.send_reasoning_content,
             "force_timeout": self.force_timeout,
             "api_key": self.api_key,
             "base_url": self.base_url,
