@@ -162,6 +162,23 @@ def _load_force_rerun_ids(raw_values: Optional[List[str]]) -> List[str]:
     return deduped
 
 
+def _validate_json_object_arg(value: Optional[str], flag_name: str) -> Optional[str]:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        console.print(f"[bold red]Error: {flag_name} must be valid JSON: {exc}[/]")
+        sys.exit(1)
+    if not isinstance(parsed, dict):
+        console.print(f"[bold red]Error: {flag_name} must be a JSON object[/]")
+        sys.exit(1)
+    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+
+
 def _get_primary_f2p_test_path(instance: TaskInstance) -> Optional[str]:
     """Pick a single representative FAIL_TO_PASS test file path for white-box messaging."""
     f2p = instance.fail_to_pass
@@ -342,6 +359,10 @@ class InferenceRunner:
             if getattr(config, "send_reasoning_content", False):
                 self.agent_env_vars["LLM_SEND_REASONING_CONTENT"] = "true"
 
+            litellm_extra_body = getattr(config, "litellm_extra_body", None)
+            if litellm_extra_body is not None and str(litellm_extra_body).strip():
+                self.agent_env_vars["LLM_LITELLM_EXTRA_BODY"] = str(litellm_extra_body).strip()
+
         # Surface force-timeout behavior to all agents via env.
         if getattr(config, "force_timeout", False):
             self.agent_env_vars["FB_FORCE_TIMEOUT"] = "true"
@@ -382,6 +403,12 @@ class InferenceRunner:
                     self.agent_env_vars["LLM_REASONING_EFFORT"] = str(recorded).strip()
                 else:
                     self.agent_env_vars.pop("LLM_REASONING_EFFORT", None)
+
+                recorded = metadata.get("litellm_extra_body")
+                if recorded is not None and str(recorded).strip():
+                    self.agent_env_vars["LLM_LITELLM_EXTRA_BODY"] = str(recorded).strip()
+                else:
+                    self.agent_env_vars.pop("LLM_LITELLM_EXTRA_BODY", None)
 
                 # OpenHands max iterations in resume mode comes from resume config
                 # (which itself is built from run_metadata.json).
@@ -792,6 +819,7 @@ class InferenceRunner:
         codex_reasoning_effort: Optional[str] = None
         native_tool_calling: Optional[bool] = None
         send_reasoning_content = False
+        litellm_extra_body: Optional[str] = None
         if self.config.agent == "openhands":
             raw = self.agent_env_vars.get("LLM_REASONING_EFFORT")
             if raw is not None and str(raw).strip():
@@ -802,6 +830,9 @@ class InferenceRunner:
             send_reasoning_content = str(
                 self.agent_env_vars.get("LLM_SEND_REASONING_CONTENT", "")
             ).strip().lower() in {"1", "true", "yes", "on"}
+            raw = self.agent_env_vars.get("LLM_LITELLM_EXTRA_BODY")
+            if raw is not None and str(raw).strip():
+                litellm_extra_body = str(raw).strip()
         elif self.config.agent == "codex":
             raw = self.agent_env_vars.get("CODEX_REASONING_EFFORT")
             if raw is not None and str(raw).strip():
@@ -829,6 +860,7 @@ class InferenceRunner:
             white_box=getattr(self.config, "white_box", False),
             native_tool_calling=native_tool_calling,
             send_reasoning_content=send_reasoning_content,
+            litellm_extra_body=litellm_extra_body,
             force_timeout=getattr(self.config, "force_timeout", False),
             api_key=self.config.api_key,
             base_url=self.config.base_url,
@@ -883,6 +915,9 @@ class InferenceRunner:
             ).strip().lower() in {"1", "true", "yes", "on"}
             if send_reasoning_content:
                 self.console.print("[white]Reasoning content:[/] [yellow]send in history[/]")
+            litellm_extra_body = self.agent_env_vars.get("LLM_LITELLM_EXTRA_BODY")
+            if litellm_extra_body is not None and str(litellm_extra_body).strip():
+                self.console.print("[white]LiteLLM extra body:[/] [yellow]configured[/]")
             effective = self.agent_env_vars.get("OPENHANDS_MAX_ITERATIONS")
             if effective is not None and str(effective).strip():
                 self.console.print(f"[white]Max iters:[/] [green]{effective}[/]")
@@ -1307,6 +1342,17 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--litellm-extra-body",
+        type=str,
+        default=None,
+        help=(
+            "OpenHands only: JSON object passed to LLM.litellm_extra_body "
+            "(for example, '{\"enable_thinking\": true}'). "
+            "In --resume mode, this argument is ignored (uses run_metadata.json)."
+        ),
+    )
+
+    parser.add_argument(
         "--max-iters",
         type=int,
         default=None,
@@ -1425,6 +1471,10 @@ def load_resume_config(resume_dir: Path, args: argparse.Namespace) -> Tuple[Infe
         warnings.append(
             "--send-reasoning-content (using 'send_reasoning_content' from metadata)"
         )
+    if args.litellm_extra_body is not None:
+        warnings.append(
+            "--litellm-extra-body (using 'litellm_extra_body' from metadata)"
+        )
     
     if warnings:
         console.print("[bold yellow]Warning: The following arguments are ignored in resume mode:[/]")
@@ -1494,6 +1544,9 @@ def load_resume_config(resume_dir: Path, args: argparse.Namespace) -> Tuple[Infe
     # Determine send_reasoning_content: always use metadata in resume mode.
     send_reasoning_content = bool(metadata.get("send_reasoning_content"))
 
+    # Determine litellm_extra_body: always use metadata in resume mode.
+    litellm_extra_body = metadata.get("litellm_extra_body")
+
     # Determine api_key/base_url/version: CLI overrides; otherwise use metadata.
     metadata_api_key = metadata.get("api_key")
     api_key = args.api_key if args.api_key is not None else metadata_api_key
@@ -1522,6 +1575,7 @@ def load_resume_config(resume_dir: Path, args: argparse.Namespace) -> Tuple[Infe
         white_box=white_box,
         native_tool_calling=native_tool_calling,
         send_reasoning_content=send_reasoning_content,
+        litellm_extra_body=litellm_extra_body,
         force_timeout=force_timeout,
         force_rerun_ids=_load_force_rerun_ids(getattr(args, "force_rerun", None)),
         api_key=api_key,
@@ -1594,6 +1648,10 @@ def main():
                 else None
             ),
             send_reasoning_content=bool(getattr(args, "send_reasoning_content", False)),
+            litellm_extra_body=_validate_json_object_arg(
+                getattr(args, "litellm_extra_body", None),
+                "--litellm-extra-body",
+            ),
             force_timeout=bool(getattr(args, "force_timeout", False)),
             force_rerun_ids=_load_force_rerun_ids(getattr(args, "force_rerun", None)),
             api_key=args.api_key,

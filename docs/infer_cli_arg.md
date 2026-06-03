@@ -140,6 +140,10 @@ flags can override metadata (see the argument list below).
   Useful for thinking models whose chat template supports reasoning history.  
   Resume mode: ignored (uses metadata).
 
+- `--litellm-extra-body`  
+  Pass a JSON object to OpenHands `LLM.litellm_extra_body`, for example `--litellm-extra-body '{"enable_thinking": true}'`.  
+  Resume mode: ignored (uses metadata).
+
 - `--max-iters`  
   Maximum iterations for OpenHands (`OPENHANDS_MAX_ITERATIONS`).  
   Default: no override (OpenHands default applies).  

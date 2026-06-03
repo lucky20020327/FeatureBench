@@ -39,6 +39,19 @@ def _env(name: str) -> str | None:
     return str(value).strip()
 
 
+def _json_object_env(name: str) -> dict[str, Any] | None:
+    value = _env(name)
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{name} must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"{name} must be a JSON object.")
+    return parsed
+
+
 def _install_send_reasoning_content_override(model: str) -> None:
     """Force OpenHands SDK to preserve/send reasoning content for this model."""
     try:
@@ -221,6 +234,10 @@ def _build_llm() -> Any:
     native_tool_calling = _env("LLM_NATIVE_TOOL_CALLING")
     if native_tool_calling is not None:
         kwargs["native_tool_calling"] = _truthy(native_tool_calling)
+
+    litellm_extra_body = _json_object_env("LLM_LITELLM_EXTRA_BODY")
+    if litellm_extra_body is not None:
+        kwargs["litellm_extra_body"] = litellm_extra_body
 
     log_completions = _env("LLM_LOG_COMPLETIONS")
     if log_completions is not None:
@@ -513,7 +530,8 @@ echo 'export LLM_LOG_COMPLETIONS_FOLDER=/agent-logs/completions' >> ~/.bashrc
             "if [ ! -x /opt/openhands-venv/bin/python ]; then "
             "echo '/opt/openhands-venv/bin/python not found' >&2; exit 127; "
             "fi; "
-            "if [[ \"${LLM_SEND_REASONING_CONTENT,,}\" =~ ^(1|true|yes|on)$ ]] && "
+            "if { [[ \"${LLM_SEND_REASONING_CONTENT,,}\" =~ ^(1|true|yes|on)$ ]] || "
+            "[ -n \"${LLM_LITELLM_EXTRA_BODY:-}\" ]; } && "
             "/opt/openhands-venv/bin/python -c "
             "\"import importlib.util, sys; "
             "sys.exit(0 if importlib.util.find_spec('openhands.sdk') else 1)\"; "
@@ -564,6 +582,8 @@ echo 'export LLM_LOG_COMPLETIONS_FOLDER=/agent-logs/completions' >> ~/.bashrc
             "LLM_NATIVE_TOOL_CALLING": self.env_vars.get("LLM_NATIVE_TOOL_CALLING"),
             # Force OpenHands SDK to send prior assistant reasoning_content in history.
             "LLM_SEND_REASONING_CONTENT": self.env_vars.get("LLM_SEND_REASONING_CONTENT"),
+            # Extra JSON body passed to LiteLLM/OpenAI-compatible backends.
+            "LLM_LITELLM_EXTRA_BODY": self.env_vars.get("LLM_LITELLM_EXTRA_BODY"),
             # Disable features not needed for FeatureBench
             "AGENT_ENABLE_PROMPT_EXTENSIONS": "false",
             "AGENT_ENABLE_BROWSING": "false",

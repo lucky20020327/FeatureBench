@@ -77,6 +77,7 @@ INFER_LOG_RENDER_MODE = "compact" # Optional: compact|full for infer.log renderi
 LLM_REASONING_EFFORT = ""     # Optional: Reasoning effort for OpenAI o-series models
 LLM_NATIVE_TOOL_CALLING = ""  # Optional: true/false to force OpenHands native tool calling; empty uses OpenHands default
 LLM_SEND_REASONING_CONTENT = "" # Optional: true to send prior assistant reasoning_content in history
+LLM_LITELLM_EXTRA_BODY = "" # Optional: JSON object passed to LiteLLM extra_body, e.g. {"enable_thinking": true}
 OPENHANDS_MAX_ITERATIONS = "" # Optional: OpenHands agent max iterations (step limit). Upstream default is 500.
 
 ```

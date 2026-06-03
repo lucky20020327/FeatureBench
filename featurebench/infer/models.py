@@ -172,6 +172,8 @@ class InferConfig:
     native_tool_calling: Optional[bool] = None
     # If True, send prior assistant reasoning content back to OpenHands LLM requests.
     send_reasoning_content: bool = False
+    # OpenHands only: JSON object passed through to LLM.litellm_extra_body.
+    litellm_extra_body: Optional[str] = None
     # Optional task IDs to force rerun even if completed.
     force_rerun_ids: Optional[List[str]] = None
     # If True, treat prior TIMEOUT attempts as completed when resuming (skip reruns).
@@ -202,6 +204,7 @@ class InferConfig:
             "white_box": self.white_box,
             "native_tool_calling": self.native_tool_calling,
             "send_reasoning_content": self.send_reasoning_content,
+            "litellm_extra_body": self.litellm_extra_body,
             "force_rerun_ids": self.force_rerun_ids,
             "force_timeout": self.force_timeout,
             "api_key": self.api_key,
@@ -264,6 +267,7 @@ class RunMetadata:
     white_box: bool = False
     native_tool_calling: Optional[bool] = None
     send_reasoning_content: bool = False
+    litellm_extra_body: Optional[str] = None
     force_timeout: bool = False
     api_key: Optional[str] = None
     base_url: Optional[str] = None
@@ -294,6 +298,7 @@ class RunMetadata:
             "white_box": self.white_box,
             "native_tool_calling": self.native_tool_calling,
             "send_reasoning_content": self.send_reasoning_content,
+            "litellm_extra_body": self.litellm_extra_body,
             "force_timeout": self.force_timeout,
             "api_key": self.api_key,
             "base_url": self.base_url,
