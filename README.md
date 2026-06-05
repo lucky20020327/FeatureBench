@@ -51,7 +51,8 @@ It provides a unified CLI to run inference, evaluation, and dataset generation.
 | 16 | GLM 4.7 | Mini-SWE-Agent | 41.2 | 6.7 |
 | 17 | Qwen3-Coder-480B-A35B-Instruct | OpenHands | 38.3 | 6.7 |
 | 18 | DeepSeek V3.2 | OpenHands | 35.9 | 6.7 |
-| 19 | Qwen3-Coder-30B-A3B-Instruct | OpenHands | 23 | 3.3 |
+| 19 | Qwen3.5-27B | OpenHands | 34.8 | 10.0 |
+| 20 | Qwen3-Coder-30B-A3B-Instruct | OpenHands | 23 | 3.3 |
 
 </details>
 <!-- LEADERBOARD_END -->
