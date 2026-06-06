@@ -17,10 +17,12 @@ Usage:
 """
 
 import argparse
+import atexit
 import json
 import logging
 import os
 import shutil
+import signal
 import threading
 import traceback
 from datetime import datetime
@@ -28,8 +30,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+import docker
 import pandas as pd
 from datasets import load_dataset
+from docker.models.containers import Container
 from rich.console import Console, Group
 from rich.live import Live
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
@@ -78,6 +82,12 @@ console = Console()
 
 
 DEFAULT_DATASET = "LiberCoders/FeatureBench"
+FEATUREBENCH_RUN_LABEL = "featurebench.run"
+FEATUREBENCH_KIND_LABEL = "featurebench.kind"
+FEATUREBENCH_TASK_LABEL = "featurebench.task"
+FEATUREBENCH_ATTEMPT_LABEL = "featurebench.attempt"
+EVAL_REPORT_COMPLETED_KEY = "featurebench_eval_completed"
+EVAL_REPORT_COMPLETED_AT_KEY = "featurebench_eval_completed_at"
 
 
 class RunningTasksTracker:
@@ -140,6 +150,233 @@ class RunningTasksView:
 
     def __rich__(self) -> Table:
         return self._tracker.build_table()
+
+
+def _mark_report_completed(report: dict[str, Any], instance_id: str) -> None:
+    instance_report = report.get(instance_id)
+    if not isinstance(instance_report, dict):
+        return
+    instance_report[EVAL_REPORT_COMPLETED_KEY] = True
+    instance_report[EVAL_REPORT_COMPLETED_AT_KEY] = datetime.now().isoformat()
+
+
+def _report_has_completion_marker(report: dict[str, Any], instance_id: str) -> bool:
+    instance_report = report.get(instance_id)
+    return (
+        isinstance(instance_report, dict)
+        and instance_report.get(EVAL_REPORT_COMPLETED_KEY) is True
+    )
+
+
+def _legacy_report_looks_interrupted(log_dir: Path) -> bool:
+    """Best-effort detection for reports written by old interrupted runs."""
+    log_file = log_dir / LOG_INSTANCE
+    if not log_file.exists():
+        return False
+
+    try:
+        log_text = log_file.read_text(encoding=UTF8, errors="replace").lower()
+    except Exception:
+        return False
+
+    if "evaluation interrupted during shutdown" in log_text:
+        return True
+    if "interrupted before container creation" in log_text:
+        return True
+
+    cleanup_failed = "failed to cleanup container" in log_text
+    cleanup_raced = (
+        "already in progress" in log_text
+        or "no such container" in log_text
+        or "not found" in log_text
+    )
+    return cleanup_failed and cleanup_raced
+
+
+def _existing_report_is_reusable(
+    report: dict[str, Any],
+    log_dir: Path,
+    instance_id: str,
+) -> bool:
+    if _report_has_completion_marker(report, instance_id):
+        return True
+
+    # Reports produced before this marker existed are still reusable unless
+    # their logs show they were written while Ctrl+C cleanup was racing the
+    # worker thread.
+    return not _legacy_report_looks_interrupted(log_dir)
+
+
+class EvalContainerCleanup:
+    """Track eval containers so interrupts can remove them reliably."""
+
+    def __init__(self, run_id: str, console: Console):
+        self.run_id = run_id
+        self.console = console
+        self._active_containers_lock = threading.RLock()
+        self._active_containers: dict[str, Container] = {}
+        self._shutdown_requested = threading.Event()
+        self._cleanup_lock = threading.RLock()
+        self._cleanup_in_progress = False
+        self._cleanup_interrupt_notice_printed = False
+        self._atexit_cleanup = self._cleanup_active_containers_at_exit
+        atexit.register(self._atexit_cleanup)
+
+    def shutdown_requested(self) -> bool:
+        return self._shutdown_requested.is_set()
+
+    def request_shutdown(self) -> None:
+        self._shutdown_requested.set()
+
+    def container_labels(
+        self,
+        instance_id: str,
+        n_attempt: int,
+        purpose: str = "eval",
+    ) -> dict[str, str]:
+        return {
+            FEATUREBENCH_RUN_LABEL: self.run_id,
+            FEATUREBENCH_KIND_LABEL: "eval",
+            FEATUREBENCH_TASK_LABEL: str(instance_id),
+            FEATUREBENCH_ATTEMPT_LABEL: str(n_attempt),
+            "featurebench.purpose": purpose,
+        }
+
+    def register(self, container: Container) -> None:
+        container_id = getattr(container, "id", None)
+        if not container_id:
+            return
+        with self._active_containers_lock:
+            self._active_containers[container_id] = container
+
+    def unregister(self, container: Container) -> None:
+        container_id = getattr(container, "id", None)
+        if not container_id:
+            return
+        with self._active_containers_lock:
+            self._active_containers.pop(container_id, None)
+
+    def _ignore_interrupt_during_cleanup(self, signum, frame) -> None:
+        self.request_shutdown()
+        if not self._cleanup_interrupt_notice_printed:
+            self._cleanup_interrupt_notice_printed = True
+            try:
+                self.console.print(
+                    "[yellow]Cleanup already in progress; ignoring additional Ctrl+C.[/]"
+                )
+            except Exception:
+                pass
+
+    def _remove_container_best_effort(self, container: Container) -> bool:
+        try:
+            container_id = getattr(container, "short_id", None) or getattr(container, "id", "")
+            try:
+                container.reload()
+            except docker.errors.NotFound:
+                return False
+            except Exception:
+                pass
+
+            try:
+                if getattr(container, "status", None) == "running":
+                    container.kill()
+            except docker.errors.NotFound:
+                return False
+            except Exception:
+                pass
+
+            try:
+                container.remove(force=True)
+                return True
+            except docker.errors.NotFound:
+                return False
+            except Exception as exc:
+                try:
+                    self.console.print(
+                        f"[yellow]Warning: failed to remove eval container {container_id}: {exc}[/]"
+                    )
+                except Exception:
+                    pass
+                return False
+        finally:
+            self.unregister(container)
+
+    def _cleanup_labeled_containers(self) -> int:
+        removed = 0
+        try:
+            client = docker.from_env()
+            label_filter = [
+                f"{FEATUREBENCH_RUN_LABEL}={self.run_id}",
+                f"{FEATUREBENCH_KIND_LABEL}=eval",
+            ]
+            containers = client.containers.list(
+                all=True,
+                filters={"label": label_filter},
+            )
+        except Exception as exc:
+            try:
+                self.console.print(
+                    f"[yellow]Warning: failed to scan eval containers by label: {exc}[/]"
+                )
+            except Exception:
+                pass
+            return removed
+
+        for container in containers:
+            if self._remove_container_best_effort(container):
+                removed += 1
+        return removed
+
+    def cleanup_active_containers(self, reason: str) -> int:
+        with self._cleanup_lock:
+            if self._cleanup_in_progress:
+                return 0
+            self._cleanup_in_progress = True
+
+        previous_sigint = None
+        signal_replaced = False
+        try:
+            if threading.current_thread() is threading.main_thread():
+                previous_sigint = signal.getsignal(signal.SIGINT)
+                signal.signal(signal.SIGINT, self._ignore_interrupt_during_cleanup)
+                signal_replaced = True
+
+            with self._active_containers_lock:
+                containers = list(self._active_containers.values())
+
+            removed = 0
+            if containers:
+                try:
+                    self.console.print(
+                        f"[yellow]Cleaning {len(containers)} active eval container(s) after {reason}...[/]"
+                    )
+                except Exception:
+                    pass
+
+            for container in containers:
+                if self._remove_container_best_effort(container):
+                    removed += 1
+
+            removed += self._cleanup_labeled_containers()
+            if removed:
+                try:
+                    self.console.print(
+                        f"[yellow]Removed {removed} eval container(s).[/]"
+                    )
+                except Exception:
+                    pass
+            return removed
+        finally:
+            if signal_replaced:
+                try:
+                    signal.signal(signal.SIGINT, previous_sigint)
+                except Exception:
+                    pass
+            with self._cleanup_lock:
+                self._cleanup_in_progress = False
+
+    def _cleanup_active_containers_at_exit(self) -> None:
+        self.cleanup_active_containers("process exit")
 
 
 def setup_logger(name: str, log_file: Path) -> logging.Logger:
@@ -206,6 +443,7 @@ def run_instance(
     gpu_scheduler: GpuScheduler | None = None,
     force_rerun_ids: set[str] | None = None,
     running_tasks_tracker: RunningTasksTracker | None = None,
+    container_cleanup: EvalContainerCleanup | None = None,
 ) -> dict[str, Any]:
     """
     Run evaluation for a single instance.
@@ -225,6 +463,16 @@ def run_instance(
     instance_id = instance[KEY_INSTANCE_ID]
     n_attempt = pred.get(KEY_N_ATTEMPT, 1)
 
+    def _interrupted_result(message: str) -> dict[str, Any]:
+        return {
+            "instance_id": instance_id,
+            "n_attempt": n_attempt,
+            "completed": False,
+            "resolved": False,
+            "patch_applied": False,
+            "error": message,
+        }
+
     # Setup logging directory
     log_dir = output_dir / "eval_outputs" / instance_id / f"attempt-{n_attempt}"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -232,16 +480,30 @@ def run_instance(
     # Check if report already exists
     report_path = log_dir / LOG_REPORT
     if report_path.exists() and (force_rerun_ids is None or instance_id not in force_rerun_ids):
-        with open(report_path, "r", encoding=UTF8) as f:
-            existing_report = json.load(f)
-        return {
-            "instance_id": instance_id,
-            "n_attempt": n_attempt,
-            "completed": True,
-            "resolved": existing_report.get(instance_id, {}).get("resolved", False),
-            "patch_applied": existing_report.get(instance_id, {}).get("patch_successfully_applied", False),
-            "report": existing_report,
-        }
+        existing_report = None
+        try:
+            with open(report_path, "r", encoding=UTF8) as f:
+                existing_report = json.load(f)
+        except Exception:
+            existing_report = None
+
+        if (
+            isinstance(existing_report, dict)
+            and _existing_report_is_reusable(existing_report, log_dir, instance_id)
+        ):
+            return {
+                "instance_id": instance_id,
+                "n_attempt": n_attempt,
+                "completed": True,
+                "resolved": existing_report.get(instance_id, {}).get("resolved", False),
+                "patch_applied": existing_report.get(instance_id, {}).get("patch_successfully_applied", False),
+                "report": existing_report,
+            }
+
+        try:
+            report_path.unlink()
+        except FileNotFoundError:
+            pass
 
     log_file = log_dir / LOG_INSTANCE
     logger = setup_logger(f"{instance_id}-{n_attempt}", log_file)
@@ -259,6 +521,9 @@ def run_instance(
     try:
         if running_tasks_tracker is not None:
             running_tasks_tracker.mark_started(instance_id, n_attempt)
+
+        if container_cleanup is not None and container_cleanup.shutdown_requested():
+            return _interrupted_result("Interrupted before container creation")
 
         # Parse repo_settings for docker runtime config (or reuse precomputed)
         docker_runtime_config = docker_runtime_config or {}
@@ -288,9 +553,24 @@ def run_instance(
         logger.info(f"Using Docker image: {docker_image}")
 
         container_manager.pull_image_if_needed(docker_image)
+        labels = None
+        if container_cleanup is not None:
+            labels = container_cleanup.container_labels(instance_id, n_attempt)
+
+        if container_cleanup is not None and container_cleanup.shutdown_requested():
+            return _interrupted_result("Interrupted before container creation")
+
         container = container_manager.create_container(
-            docker_image, instance_id, n_attempt, task_gpu_ids, proxy_port, docker_runtime_config
+            docker_image,
+            instance_id,
+            n_attempt,
+            task_gpu_ids,
+            proxy_port,
+            docker_runtime_config,
+            labels=labels,
         )
+        if container_cleanup is not None:
+            container_cleanup.register(container)
 
         # Run evaluation based on level
         level = int(instance["level"])
@@ -300,6 +580,12 @@ def run_instance(
             results = run_instance_level2(instance, pred, container, logger, log_dir, timeout)
         else:
             raise ValueError(f"Unsupported level: {level}")
+
+        if container_cleanup is not None and container_cleanup.shutdown_requested():
+            logger.warning(
+                "Evaluation interrupted during shutdown; not saving report."
+            )
+            return _interrupted_result("Interrupted during shutdown")
 
         # Save patch
         patch_content = pred.get(KEY_PREDICTION, "")
@@ -330,7 +616,22 @@ def run_instance(
             p2p_failure_list=p2p_failure,
             eval_results=results,
         )
+        _mark_report_completed(report, instance_id)
+        if container_cleanup is not None and container_cleanup.shutdown_requested():
+            logger.warning(
+                "Evaluation interrupted during shutdown; not saving report."
+            )
+            return _interrupted_result("Interrupted during shutdown")
         save_report(report, log_dir)
+        if container_cleanup is not None and container_cleanup.shutdown_requested():
+            logger.warning(
+                "Evaluation interrupted during shutdown; removing saved report."
+            )
+            try:
+                report_path.unlink()
+            except FileNotFoundError:
+                pass
+            return _interrupted_result("Interrupted during shutdown")
 
         resolved = report[instance_id]["resolved"]
         f2p_pass_rate = report[instance_id]["pass_rate"]
@@ -344,10 +645,31 @@ def run_instance(
         # Save review codes if requested
         if review_codes:
             logger.info("Saving agent-generated code for review...")
+            review_labels = None
+            if container_cleanup is not None:
+                review_labels = container_cleanup.container_labels(
+                    instance_id,
+                    n_attempt,
+                    purpose="review",
+                )
             if level == 1:
-                save_review_codes_level1(instance, patch_content, log_dir, docker_image, logger)
+                save_review_codes_level1(
+                    instance,
+                    patch_content,
+                    log_dir,
+                    docker_image,
+                    logger,
+                    labels=review_labels,
+                )
             elif level == 2:
-                save_review_codes_level2(instance, patch_content, log_dir, docker_image, logger)
+                save_review_codes_level2(
+                    instance,
+                    patch_content,
+                    log_dir,
+                    docker_image,
+                    logger,
+                    labels=review_labels,
+                )
             logger.info("Review codes saved.")
 
         return {
@@ -363,6 +685,12 @@ def run_instance(
         logger.error(f"Error during evaluation: {str(e)}")
         logger.error(traceback.format_exc())
 
+        if container_cleanup is not None and container_cleanup.shutdown_requested():
+            logger.warning(
+                "Evaluation interrupted during shutdown; not saving failure report."
+            )
+            return _interrupted_result(f"Interrupted during shutdown: {e}")
+
         # Generate and save error report
         patch_content = pred.get(KEY_PREDICTION, "")
         error_report = generate_error_report(
@@ -372,7 +700,17 @@ def run_instance(
             error=str(e),
             traceback_str=traceback.format_exc(),
         )
+        _mark_report_completed(error_report, instance_id)
         save_report(error_report, log_dir)
+        if container_cleanup is not None and container_cleanup.shutdown_requested():
+            logger.warning(
+                "Evaluation interrupted during shutdown; removing saved failure report."
+            )
+            try:
+                report_path.unlink()
+            except FileNotFoundError:
+                pass
+            return _interrupted_result(f"Interrupted during shutdown: {e}")
 
         return {
             "instance_id": instance_id,
@@ -387,7 +725,11 @@ def run_instance(
     finally:
         # Cleanup container
         if container is not None:
-            container_manager.cleanup_container(container)
+            try:
+                container_manager.cleanup_container(container)
+            finally:
+                if container_cleanup is not None:
+                    container_cleanup.unregister(container)
 
         # Release GPU lease even if container creation failed.
         if gpu_lease is not None and gpu_scheduler is not None:
@@ -770,6 +1112,8 @@ def main():
             )
 
     force_rerun_ids = _load_force_rerun_ids(args.force_rerun)
+    eval_run_id = f"eval-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}-{os.getpid()}"
+    container_cleanup = EvalContainerCleanup(eval_run_id, console)
 
     # Run evaluations in parallel with rich progress
     results = []
@@ -797,9 +1141,13 @@ def main():
         console=console,
         refresh_per_second=10,
     ):
-        with ThreadPoolExecutor(max_workers=args.n_concurrent) as executor:
-            futures = {
-                executor.submit(
+        executor = ThreadPoolExecutor(max_workers=args.n_concurrent)
+        futures = {}
+        try:
+            for instance, pred, docker_runtime_config in instances_to_eval:
+                if container_cleanup.shutdown_requested():
+                    break
+                future = executor.submit(
                     run_instance,
                     instance,
                     pred,
@@ -813,9 +1161,9 @@ def main():
                     gpu_scheduler,
                     force_rerun_ids,
                     running_tasks_tracker,
-                ): instance[KEY_INSTANCE_ID]
-                for instance, pred, docker_runtime_config in instances_to_eval
-            }
+                    container_cleanup,
+                )
+                futures[future] = instance[KEY_INSTANCE_ID]
 
             for future in as_completed(futures):
                 instance_id = futures[future]
@@ -844,6 +1192,17 @@ def main():
                     resolved=resolved_count,
                     failed=failed_count
                 )
+        except KeyboardInterrupt:
+            container_cleanup.request_shutdown()
+            for pending_future in futures:
+                pending_future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            console.print("[bold yellow]Interrupted; cleaning FeatureBench eval containers...[/]")
+            container_cleanup.cleanup_active_containers("keyboard interrupt")
+            return 130
+        finally:
+            if not container_cleanup.shutdown_requested():
+                executor.shutdown(wait=True)
 
     # Generate and save summary report
     console.print()
@@ -862,4 +1221,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

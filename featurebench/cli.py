@@ -56,6 +56,8 @@ def _run_with_patched_argv(
         if result is None:
             return 0
         return int(result)
+    except KeyboardInterrupt:
+        return 130
     except SystemExit as exc:
         code = exc.code
         if code is None:

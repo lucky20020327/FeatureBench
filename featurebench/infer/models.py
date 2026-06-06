@@ -174,6 +174,8 @@ class InferConfig:
     send_reasoning_content: bool = False
     # OpenHands only: JSON object passed through to LLM.litellm_extra_body.
     litellm_extra_body: Optional[str] = None
+    # OpenHands only: attach an X-Session-Id header per task attempt and release it after the run.
+    session_cache: bool = False
     # Optional task IDs to force rerun even if completed.
     force_rerun_ids: Optional[List[str]] = None
     # If True, treat prior TIMEOUT attempts as completed when resuming (skip reruns).
@@ -205,6 +207,7 @@ class InferConfig:
             "native_tool_calling": self.native_tool_calling,
             "send_reasoning_content": self.send_reasoning_content,
             "litellm_extra_body": self.litellm_extra_body,
+            "session_cache": self.session_cache,
             "force_rerun_ids": self.force_rerun_ids,
             "force_timeout": self.force_timeout,
             "api_key": self.api_key,
@@ -268,6 +271,7 @@ class RunMetadata:
     native_tool_calling: Optional[bool] = None
     send_reasoning_content: bool = False
     litellm_extra_body: Optional[str] = None
+    session_cache: bool = False
     force_timeout: bool = False
     api_key: Optional[str] = None
     base_url: Optional[str] = None
@@ -299,6 +303,7 @@ class RunMetadata:
             "native_tool_calling": self.native_tool_calling,
             "send_reasoning_content": self.send_reasoning_content,
             "litellm_extra_body": self.litellm_extra_body,
+            "session_cache": self.session_cache,
             "force_timeout": self.force_timeout,
             "api_key": self.api_key,
             "base_url": self.base_url,

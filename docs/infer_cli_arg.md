@@ -135,13 +135,17 @@ flags can override metadata (see the argument list below).
   Force native tool calling off (`LLM_NATIVE_TOOL_CALLING=false`).  
   Resume mode: ignored (uses metadata).
 
-- `--send-reasoning-content`  
-  Send prior assistant `reasoning_content` back to the model in subsequent OpenHands requests.  
-  Useful for thinking models whose chat template supports reasoning history.  
+- `--send-reasoning-content`
+  Send prior assistant reasoning back to the model in subsequent OpenHands requests using both `reasoning_content` and `reasoning` fields.
+  Useful for thinking models whose chat template supports reasoning history.
   Resume mode: ignored (uses metadata).
 
 - `--litellm-extra-body`  
   Pass a JSON object to OpenHands `LLM.litellm_extra_body`, for example `--litellm-extra-body '{"enable_thinking": true}'`.  
+  Resume mode: ignored (uses metadata).
+
+- `--session-cache`
+  Enable backend KV-cache session reuse for OpenHands by sending a unique `X-Session-Id` header for each task attempt and releasing it after the run with `DELETE /session_release?session_id=...`.
   Resume mode: ignored (uses metadata).
 
 - `--max-iters`  

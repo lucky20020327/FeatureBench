@@ -135,6 +135,7 @@ def save_review_codes_level1(
     log_dir: Path,
     docker_image: str,
     logger: logging.Logger,
+    labels: dict[str, str] | None = None,
 ) -> None:
     """
     Save review codes for Level 1 instance.
@@ -176,6 +177,7 @@ def save_review_codes_level1(
             name=container_name,
             detach=True,
             remove=False,
+            labels=labels,
         )
 
         # Step 1: Restore project
@@ -290,6 +292,7 @@ def save_review_codes_level2(
     log_dir: Path,
     docker_image: str,
     logger: logging.Logger,
+    labels: dict[str, str] | None = None,
 ) -> None:
     """
     Save review codes for Level 2 instance.
@@ -332,6 +335,7 @@ def save_review_codes_level2(
             name=container_name,
             detach=True,
             remove=False,
+            labels=labels,
         )
 
         # Step 1: Clean /testbed/ and create README.md

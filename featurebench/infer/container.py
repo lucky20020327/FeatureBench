@@ -112,6 +112,7 @@ class ContainerManager:
         container_name: Optional[str] = None,
         working_dir: str = "/testbed",
         extra_env: Optional[Dict[str, str]] = None,
+        labels: Optional[Dict[str, str]] = None,
         volumes: Optional[Dict[str, Dict]] = None,
         use_host_network: bool = False,
         proxy_port: Optional[int] = None,
@@ -126,6 +127,7 @@ class ContainerManager:
             container_name: Optional container name
             working_dir: Working directory inside container
             extra_env: Additional environment variables
+            labels: Docker labels to attach to the container
             volumes: Volume mounts
             use_host_network: Whether to use host network mode (default: False, if proxy_port is not None, use host network)
             proxy_port: Proxy port to use for inference (default: None)
@@ -137,16 +139,18 @@ class ContainerManager:
         """
         docker_runtime_config = docker_runtime_config or {}
         
-        # Merge environment variables
+        # Merge environment variables. extra_env is task-specific and should win
+        # over both global agent env and repo-level docker runtime env.
         env = dict(self.env_vars)
-        if extra_env:
-            env.update(extra_env)
-        
+
         # Add environment variables from docker_runtime_config
         env_vars_from_config = docker_runtime_config.get("env_vars", {})
         if env_vars_from_config:
             env.update(env_vars_from_config)
             self.logger.info(f"Added environment variables from config: {list(env_vars_from_config.keys())}")
+
+        if extra_env:
+            env.update(extra_env)
         
         # Convert env dict to list format
         # Replace localhost/127.0.0.1 with Docker host gateway IP for bridge mode
@@ -242,7 +246,8 @@ class ContainerManager:
                 platform="linux/amd64",
                 network_mode="host" if use_host_network else "bridge",
                 device_requests=device_requests,
-                shm_size=shm_size
+                shm_size=shm_size,
+                labels=labels,
             )
             
             # Check if GPU is available

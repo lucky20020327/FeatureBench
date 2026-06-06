@@ -1,4 +1,5 @@
 import logging
+import atexit
 import subprocess
 import tempfile
 import os
@@ -6,6 +7,8 @@ import hashlib
 import platform
 import importlib.util
 import shutil
+import signal
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional, List, Tuple
 from pathlib import Path
@@ -22,6 +25,11 @@ from featurebench.utils.logger import (
 	run_command_with_streaming_log
 )
 from featurebench.utils.utils import select_candidate_pool_and_allocate_gpu, release_gpu
+
+
+FEATUREBENCH_RUN_LABEL = "featurebench.run"
+FEATUREBENCH_KIND_LABEL = "featurebench.kind"
+FEATUREBENCH_TASK_LABEL = "featurebench.task"
 
 
 class ImageManager:
@@ -52,6 +60,159 @@ class ImageManager:
         
         # Track GPUs per container: {container_id: [gpu_id, ...]}
         self._container_gpu_map: Dict[str, List[int]] = {}
+
+        # Track containers created by fb data so Ctrl+C/process-exit cleanup can
+        # remove them even if worker threads do not reach their own finally block.
+        self._cleanup_run_id = f"data-{int(time.time() * 1000)}-{os.getpid()}"
+        self._active_container_ids_lock = threading.RLock()
+        self._active_container_ids: set[str] = set()
+        self._cleanup_lock = threading.RLock()
+        self._cleanup_in_progress = False
+        self._cleanup_interrupt_notice_printed = False
+        self._previous_sigint = None
+        self._signal_cleanup_installed = False
+        if threading.current_thread() is threading.main_thread():
+            self._previous_sigint = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, self._handle_interrupt)
+            self._signal_cleanup_installed = True
+        self._atexit_cleanup = self._cleanup_active_containers_at_exit
+        atexit.register(self._atexit_cleanup)
+
+    def _container_labels(self, specs_name: str, purpose: str = "data") -> Dict[str, str]:
+        return {
+            FEATUREBENCH_RUN_LABEL: self._cleanup_run_id,
+            FEATUREBENCH_KIND_LABEL: "data",
+            FEATUREBENCH_TASK_LABEL: str(specs_name),
+            "featurebench.purpose": purpose,
+        }
+
+    def _add_container_label_args(self, docker_command: List[str], specs_name: str) -> None:
+        for key, value in self._container_labels(specs_name).items():
+            docker_command.extend(["--label", f"{key}={value}"])
+
+    def _register_container_id(self, container_id: str) -> None:
+        if not container_id:
+            return
+        with self._active_container_ids_lock:
+            self._active_container_ids.add(container_id)
+
+    def _unregister_container_id(self, container_id: str) -> None:
+        if not container_id:
+            return
+        with self._active_container_ids_lock:
+            self._active_container_ids.discard(container_id)
+
+    def _ignore_interrupt_during_cleanup(self, signum, frame) -> None:
+        if not self._cleanup_interrupt_notice_printed:
+            self._cleanup_interrupt_notice_printed = True
+            try:
+                self.logger.warning("Cleanup already in progress; ignoring additional Ctrl+C.")
+            except Exception:
+                pass
+
+    def _handle_interrupt(self, signum, frame) -> None:
+        try:
+            self.logger.warning("Interrupted; cleaning FeatureBench data containers...")
+        except Exception:
+            pass
+        self.cleanup_active_containers("keyboard interrupt")
+
+        previous = self._previous_sigint
+        if callable(previous):
+            previous(signum, frame)
+        elif previous == signal.SIG_DFL:
+            raise KeyboardInterrupt
+
+    def _release_container_gpu(self, container_id: str) -> None:
+        gpu_ids = self._container_gpu_map.pop(container_id, None)
+        if gpu_ids:
+            release_gpu(gpu_ids, self.logger)
+            self.logger.debug(f"Container {container_id[:12]} released GPUs {gpu_ids}")
+
+    def _remove_container_id_best_effort(self, container_id: str) -> bool:
+        if not container_id:
+            return False
+        try:
+            self._release_container_gpu(container_id)
+            subprocess.run(["docker", "kill", container_id], capture_output=True)
+            subprocess.run(["docker", "rm", "-f", container_id], capture_output=True)
+            return True
+        finally:
+            self._unregister_container_id(container_id)
+
+    def _cleanup_labeled_containers(self) -> int:
+        try:
+            result = subprocess.run(
+                [
+                    "docker",
+                    "ps",
+                    "-aq",
+                    "--filter",
+                    f"label={FEATUREBENCH_RUN_LABEL}={self._cleanup_run_id}",
+                    "--filter",
+                    f"label={FEATUREBENCH_KIND_LABEL}=data",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception as exc:
+            self.logger.warning(f"Failed to scan FeatureBench data containers by label: {exc}")
+            return 0
+
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            if stderr:
+                self.logger.warning(f"Failed to scan FeatureBench data containers by label: {stderr}")
+            return 0
+
+        removed = 0
+        for container_id in result.stdout.splitlines():
+            if self._remove_container_id_best_effort(container_id.strip()):
+                removed += 1
+        return removed
+
+    def cleanup_active_containers(self, reason: str) -> int:
+        with self._cleanup_lock:
+            if self._cleanup_in_progress:
+                return 0
+            self._cleanup_in_progress = True
+
+        previous_sigint = None
+        signal_replaced = False
+        try:
+            if threading.current_thread() is threading.main_thread():
+                previous_sigint = signal.getsignal(signal.SIGINT)
+                signal.signal(signal.SIGINT, self._ignore_interrupt_during_cleanup)
+                signal_replaced = True
+
+            with self._active_container_ids_lock:
+                container_ids = list(self._active_container_ids)
+
+            removed = 0
+            if container_ids:
+                self.logger.warning(
+                    f"Cleaning {len(container_ids)} active FeatureBench data container(s) after {reason}..."
+                )
+            for container_id in container_ids:
+                if self._remove_container_id_best_effort(container_id):
+                    removed += 1
+
+            removed += self._cleanup_labeled_containers()
+            if removed:
+                self.logger.warning(f"Removed {removed} FeatureBench data container(s).")
+            return removed
+        finally:
+            if signal_replaced:
+                try:
+                    signal.signal(signal.SIGINT, previous_sigint)
+                except Exception:
+                    pass
+            with self._cleanup_lock:
+                self._cleanup_in_progress = False
+
+    def _cleanup_active_containers_at_exit(self) -> None:
+        self.cleanup_active_containers("process exit")
     
     def prepare_images(self, repo_manager: RepoManager) -> None:
         """
@@ -664,6 +825,7 @@ RUN echo "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbe
         
         # Add runtime config to docker_command and compute env_setup + GPU IDs
         env_setup_cmd, selected_gpu_ids = self._add_docker_runtime_config(docker_command, specs)
+        self._add_container_label_args(docker_command, specs_name)
         
         # Add image
         docker_command.append(instance_image)
@@ -695,6 +857,7 @@ RUN echo "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbe
         )
         
         container_id = result.stdout.strip()
+        self._register_container_id(container_id)
         
         # Record GPUs used by container (if any)
         if selected_gpu_ids:
@@ -1097,17 +1260,16 @@ RUN echo "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbe
             container_id: Container ID
             force: Force kill without graceful stop (use on timeout)
         """
-        # Release GPUs used by container before stop
-        gpu_ids = self._container_gpu_map.get(container_id)
-        if gpu_ids:
-            release_gpu(gpu_ids, self.logger)
-            del self._container_gpu_map[container_id]
-            self.logger.debug(f"Container {container_id[:12]} released GPUs {gpu_ids}")
-        
-        if force:
-            # Force kill container (no wait)
-            subprocess.run(['docker', 'kill', container_id], capture_output=True)
-        else:
-            # Graceful stop
-            subprocess.run(['docker', 'stop', container_id], capture_output=True)
-        subprocess.run(['docker', 'rm', container_id], capture_output=True)
+        try:
+            # Release GPUs used by container before stop
+            self._release_container_gpu(container_id)
+
+            if force:
+                # Force kill container (no wait)
+                subprocess.run(['docker', 'kill', container_id], capture_output=True)
+            else:
+                # Graceful stop
+                subprocess.run(['docker', 'stop', container_id], capture_output=True)
+            subprocess.run(['docker', 'rm', container_id], capture_output=True)
+        finally:
+            self._unregister_container_id(container_id)

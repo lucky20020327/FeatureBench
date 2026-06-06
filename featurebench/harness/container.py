@@ -190,6 +190,7 @@ class EvalContainerManager:
         gpu_ids: str | None = None,
         proxy_port: int | None = None,
         docker_runtime_config: dict | None = None,
+        labels: dict[str, str] | None = None,
     ) -> Container:
         """
         Create and start a Docker container for evaluation.
@@ -201,6 +202,7 @@ class EvalContainerManager:
             gpu_ids: Comma-separated GPU IDs to use
             proxy_port: Proxy port for network access (uses bridge network with Docker host gateway)
             docker_runtime_config: Runtime config from repo_settings (need_gpu, shm_size, env_vars, env_exports, number_once)
+            labels: Docker labels to attach to the container
 
         Returns:
             Docker container object
@@ -297,6 +299,7 @@ class EvalContainerManager:
             environment=environment,
             network_mode=network_mode,
             shm_size=shm_size,
+            labels=labels,
         )
 
         # Check if GPU is available
@@ -366,4 +369,3 @@ class EvalContainerManager:
             self.logger.info("Container removed successfully")
         except Exception as e:
             self.logger.warning(f"Failed to cleanup container: {e}")
-

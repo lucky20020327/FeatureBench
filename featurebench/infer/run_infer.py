@@ -10,16 +10,21 @@ Usage:
 """
 
 import argparse
+import atexit
 import json
 import logging
 import re
+import signal
 import sys
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import docker
+from docker.models.containers import Container
 from rich.console import Console, Group
 from rich.live import Live
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
@@ -37,6 +42,11 @@ from featurebench.utils.docker_images import normalize_image_name
 
 # Configure console logging - minimal output to terminal
 console = Console()
+
+FEATUREBENCH_RUN_LABEL = "featurebench.run"
+FEATUREBENCH_KIND_LABEL = "featurebench.kind"
+FEATUREBENCH_TASK_LABEL = "featurebench.task"
+FEATUREBENCH_ATTEMPT_LABEL = "featurebench.attempt"
 
 
 def setup_console_logging():
@@ -441,6 +451,16 @@ class InferenceRunner:
         # Track currently running tasks for live terminal display.
         self._running_tasks_lock = threading.Lock()
         self._running_tasks: Dict[Tuple[str, int], datetime] = {}
+        # Track containers created by this runner so Ctrl+C/process-exit cleanup
+        # even when worker threads are interrupted before their own finally block.
+        self._active_containers_lock = threading.RLock()
+        self._active_containers: Dict[str, Container] = {}
+        self._shutdown_requested = threading.Event()
+        self._cleanup_lock = threading.RLock()
+        self._cleanup_in_progress = False
+        self._cleanup_interrupt_notice_printed = False
+        self._atexit_cleanup = self._cleanup_active_containers_at_exit
+        atexit.register(self._atexit_cleanup)
 
     @staticmethod
     def _format_elapsed(total_seconds: float) -> str:
@@ -449,6 +469,165 @@ class InferenceRunner:
         hours, rem = divmod(seconds, 3600)
         minutes, secs = divmod(rem, 60)
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def _build_session_id(self, task_id: str, attempt: int) -> str:
+        """Build a unique backend session id for one OpenHands task attempt."""
+        safe_task_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", task_id).strip("-")
+        safe_task_id = safe_task_id[:160] or "task"
+        return (
+            f"fb-{self.run_timestamp}-{safe_task_id}-attempt-{attempt}-"
+            f"{uuid.uuid4().hex[:12]}"
+        )
+
+    def _container_labels(
+        self,
+        task_id: str,
+        attempt: int,
+        purpose: str = "task",
+    ) -> Dict[str, str]:
+        return {
+            FEATUREBENCH_RUN_LABEL: self.run_timestamp,
+            FEATUREBENCH_KIND_LABEL: "infer",
+            FEATUREBENCH_TASK_LABEL: str(task_id),
+            FEATUREBENCH_ATTEMPT_LABEL: str(attempt),
+            "featurebench.purpose": purpose,
+        }
+
+    def _register_container(self, container: Container) -> None:
+        container_id = getattr(container, "id", None)
+        if not container_id:
+            return
+        with self._active_containers_lock:
+            self._active_containers[container_id] = container
+
+    def _unregister_container(self, container: Container) -> None:
+        container_id = getattr(container, "id", None)
+        if not container_id:
+            return
+        with self._active_containers_lock:
+            self._active_containers.pop(container_id, None)
+
+    def _ignore_interrupt_during_cleanup(self, signum, frame) -> None:
+        self._shutdown_requested.set()
+        if not self._cleanup_interrupt_notice_printed:
+            self._cleanup_interrupt_notice_printed = True
+            try:
+                self.console.print(
+                    "[yellow]Cleanup already in progress; ignoring additional Ctrl+C.[/]"
+                )
+            except Exception:
+                pass
+
+    def _remove_container_best_effort(self, container: Container) -> bool:
+        try:
+            container_id = getattr(container, "short_id", None) or getattr(container, "id", "")
+            try:
+                container.reload()
+            except docker.errors.NotFound:
+                return False
+            except Exception:
+                pass
+
+            try:
+                if getattr(container, "status", None) == "running":
+                    container.kill()
+            except docker.errors.NotFound:
+                return False
+            except Exception:
+                pass
+
+            try:
+                container.remove(force=True)
+                return True
+            except docker.errors.NotFound:
+                return False
+            except Exception as exc:
+                try:
+                    self.console.print(
+                        f"[yellow]Warning: failed to remove container {container_id}: {exc}[/]"
+                    )
+                except Exception:
+                    pass
+                return False
+        finally:
+            self._unregister_container(container)
+
+    def _cleanup_labeled_containers(self) -> int:
+        removed = 0
+        try:
+            client = docker.from_env()
+            label_filter = [
+                f"{FEATUREBENCH_RUN_LABEL}={self.run_timestamp}",
+                f"{FEATUREBENCH_KIND_LABEL}=infer",
+            ]
+            containers = client.containers.list(
+                all=True,
+                filters={"label": label_filter},
+            )
+        except Exception as exc:
+            try:
+                self.console.print(
+                    f"[yellow]Warning: failed to scan FeatureBench containers by label: {exc}[/]"
+                )
+            except Exception:
+                pass
+            return removed
+
+        for container in containers:
+            if self._remove_container_best_effort(container):
+                removed += 1
+        return removed
+
+    def _cleanup_active_containers(self, reason: str) -> int:
+        with self._cleanup_lock:
+            if self._cleanup_in_progress:
+                return 0
+            self._cleanup_in_progress = True
+
+        previous_sigint = None
+        signal_replaced = False
+        try:
+            if threading.current_thread() is threading.main_thread():
+                previous_sigint = signal.getsignal(signal.SIGINT)
+                signal.signal(signal.SIGINT, self._ignore_interrupt_during_cleanup)
+                signal_replaced = True
+
+            with self._active_containers_lock:
+                containers = list(self._active_containers.values())
+
+            removed = 0
+            if containers:
+                try:
+                    self.console.print(
+                        f"[yellow]Cleaning {len(containers)} active FeatureBench container(s) after {reason}...[/]"
+                    )
+                except Exception:
+                    pass
+
+            for container in containers:
+                if self._remove_container_best_effort(container):
+                    removed += 1
+
+            removed += self._cleanup_labeled_containers()
+            if removed:
+                try:
+                    self.console.print(
+                        f"[yellow]Removed {removed} FeatureBench container(s).[/]"
+                    )
+                except Exception:
+                    pass
+            return removed
+        finally:
+            if signal_replaced:
+                try:
+                    signal.signal(signal.SIGINT, previous_sigint)
+                except Exception:
+                    pass
+            with self._cleanup_lock:
+                self._cleanup_in_progress = False
+
+    def _cleanup_active_containers_at_exit(self) -> None:
+        self._cleanup_active_containers("process exit")
 
     def _mark_task_started(self, task_id: str, attempt: int) -> None:
         """Record task start for live running-task display."""
@@ -578,6 +757,10 @@ class InferenceRunner:
         self._mark_task_started(task_id, attempt)
         
         try:
+            if self._shutdown_requested.is_set():
+                result.error = "Interrupted before container creation"
+                return result
+
             # Get Docker image
             image_name = self._get_image_name(instance)
             
@@ -602,12 +785,29 @@ class InferenceRunner:
                     f"(pool={','.join(self._gpu_scheduler.gpu_pool)})"
                 )
             
-            # Create container manager with task-specific logger
-            cm = ContainerManager(task_logger, self.agent_env_vars)
+            task_agent_env_vars = dict(self.agent_env_vars)
+            container_extra_env = None
+            if (
+                self.config.agent == "openhands"
+                and getattr(self.config, "session_cache", False)
+            ):
+                session_id = self._build_session_id(task_id, attempt)
+                task_agent_env_vars["LLM_SESSION_ID"] = session_id
+                container_extra_env = {"LLM_SESSION_ID": session_id}
+                task_logger.info(
+                    f"OpenHands session cache enabled: session_id={session_id}"
+                )
+
+            # Create container manager with task-specific logger/env.
+            cm = ContainerManager(task_logger, task_agent_env_vars)
             
             # Pull image if needed
             task_logger.info(f"Ensuring image {image_name} is available...")
             cm.pull_image(image_name)
+
+            if self._shutdown_requested.is_set():
+                result.error = "Interrupted before container creation"
+                return result
             
             # Create container with timestamp to avoid name conflicts
             container_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -628,11 +828,14 @@ class InferenceRunner:
                 image_name=image_name,
                 container_name=container_name,
                 working_dir="/testbed",
+                extra_env=container_extra_env,
+                labels=self._container_labels(task_id, attempt),
                 proxy_port=self.config.proxy_port,
                 gpu_ids=task_gpu_ids,
                 docker_runtime_config=docker_runtime_config,
                 volumes=volumes
             )
+            self._register_container(container)
             
             # Initialize runtime with task-specific logger
             runtime_handler = RuntimeHandler(cm, task_logger)
@@ -650,7 +853,7 @@ class InferenceRunner:
             agent = get_agent(
                 self.config.agent,
                 container_manager=cm,
-                env_vars=self.agent_env_vars,
+                env_vars=task_agent_env_vars,
                 logger=task_logger,
                 model=self.config.model,
                 version=self.config.version,
@@ -715,6 +918,8 @@ class InferenceRunner:
                     cm.stop_container(container, force=True)
                 except Exception as e:
                     task_logger.warning(f"Error cleaning up container: {e}")
+                finally:
+                    self._unregister_container(container)
 
             # Release GPU lease even if container creation failed.
             if gpu_lease is not None and self._gpu_scheduler is not None:
@@ -744,8 +949,14 @@ class InferenceRunner:
         container = None
         gpu_lease: Optional[GpuLease] = None
         try:
+            if self._shutdown_requested.is_set():
+                return
+
             cm = ContainerManager(task_logger, self.agent_env_vars)
             cm.pull_image(image_name)
+
+            if self._shutdown_requested.is_set():
+                return
 
             volumes = None
             if self.cache_dir:
@@ -771,11 +982,13 @@ class InferenceRunner:
             container = cm.create_container(
                 image_name=image_name,
                 working_dir="/testbed",
+                labels=self._container_labels("warmup", 0, purpose="warmup"),
                 proxy_port=self.config.proxy_port,
                 gpu_ids=task_gpu_ids,
                 docker_runtime_config=docker_runtime_config,
                 volumes=volumes
             )
+            self._register_container(container)
 
             agent = get_agent(
                 self.config.agent,
@@ -794,6 +1007,8 @@ class InferenceRunner:
                     cm.stop_container(container, force=True)
                 except Exception as e:
                     task_logger.warning(f"Error cleaning up warmup container: {e}")
+                finally:
+                    self._unregister_container(container)
 
             if gpu_lease is not None and self._gpu_scheduler is not None:
                 try:
@@ -861,6 +1076,7 @@ class InferenceRunner:
             native_tool_calling=native_tool_calling,
             send_reasoning_content=send_reasoning_content,
             litellm_extra_body=litellm_extra_body,
+            session_cache=bool(getattr(self.config, "session_cache", False)),
             force_timeout=getattr(self.config, "force_timeout", False),
             api_key=self.config.api_key,
             base_url=self.config.base_url,
@@ -868,7 +1084,7 @@ class InferenceRunner:
         )
         self.output_manager.save_metadata(metadata)
     
-    def run(self) -> None:
+    def run(self) -> int:
         """Run the inference pipeline."""
         # Print startup banner to console
         self.console.print()
@@ -915,6 +1131,8 @@ class InferenceRunner:
             ).strip().lower() in {"1", "true", "yes", "on"}
             if send_reasoning_content:
                 self.console.print("[white]Reasoning content:[/] [yellow]send in history[/]")
+            if getattr(self.config, "session_cache", False):
+                self.console.print("[white]Session cache:[/] [yellow]enabled[/]")
             litellm_extra_body = self.agent_env_vars.get("LLM_LITELLM_EXTRA_BODY")
             if litellm_extra_body is not None and str(litellm_extra_body).strip():
                 self.console.print("[white]LiteLLM extra body:[/] [yellow]configured[/]")
@@ -951,7 +1169,7 @@ class InferenceRunner:
         
         if not instances:
             self.console.print("[bold red]No task instances to process[/]")
-            return
+            return 0
 
         # Initialize GPU scheduler (best-effort) if there are any GPU tasks.
         try:
@@ -997,6 +1215,11 @@ class InferenceRunner:
             self.console.print("[bold blue]Warming cache before parallel execution...[/]")
             try:
                 self._warmup_cache(instances[0])
+            except KeyboardInterrupt:
+                self._shutdown_requested.set()
+                self.console.print("[bold yellow]Interrupted during cache warmup; cleaning containers...[/]")
+                self._cleanup_active_containers("keyboard interrupt")
+                return 130
             except Exception as e:
                 self.console.print(f"[bold yellow]Cache warmup failed (continuing): {e}[/]")
         
@@ -1036,7 +1259,7 @@ class InferenceRunner:
             
             if total_tasks == 0:
                 self.console.print("[bold green]All tasks already completed![/]")
-                return
+                return 0
             
             # Process tasks with rich progress bar + live running-task list
             progress = Progress(
@@ -1080,12 +1303,15 @@ class InferenceRunner:
                         )
                 else:
                     # Parallel processing
-                    with ThreadPoolExecutor(max_workers=self.config.n_concurrent) as executor:
+                    executor = ThreadPoolExecutor(max_workers=self.config.n_concurrent)
+                    future_to_task = {}
+                    try:
                         # Submit all tasks
-                        future_to_task = {
-                            executor.submit(self._process_single_task, inst, att): (inst.instance_id, att)
-                            for inst, att in tasks
-                        }
+                        for inst, att in tasks:
+                            if self._shutdown_requested.is_set():
+                                break
+                            future = executor.submit(self._process_single_task, inst, att)
+                            future_to_task[future] = (inst.instance_id, att)
                         
                         # Process results as they complete
                         for future in as_completed(future_to_task):
@@ -1120,6 +1346,21 @@ class InferenceRunner:
                                 success=success_count,
                                 failure=failure_count
                             )
+                    except KeyboardInterrupt:
+                        self._shutdown_requested.set()
+                        for pending_future in future_to_task:
+                            pending_future.cancel()
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        raise
+                    finally:
+                        if not self._shutdown_requested.is_set():
+                            executor.shutdown(wait=True)
+
+        except KeyboardInterrupt:
+            self._shutdown_requested.set()
+            self.console.print("[bold yellow]Interrupted; cleaning FeatureBench containers...[/]")
+            self._cleanup_active_containers("keyboard interrupt")
+            return 130
         
         finally:
             # Stop output manager
@@ -1137,6 +1378,7 @@ class InferenceRunner:
         self.console.print(f"[white]Run summary:[/] [green]{self.output_manager.run_summary_path}[/]")
         self.console.print("[bold cyan]" + "=" * 60 + "[/]")
         self.console.print()
+        return 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -1335,7 +1577,8 @@ def parse_args() -> argparse.Namespace:
         "--send-reasoning-content",
         action="store_true",
         help=(
-            "OpenHands only: send prior assistant reasoning_content back to the model in subsequent requests. "
+            "OpenHands only: send prior assistant reasoning back to the model in subsequent requests "
+            "using both reasoning_content and reasoning fields. "
             "Useful for thinking models whose chat template supports reasoning history. "
             "In --resume mode, this flag is ignored and the value from run_metadata.json is used."
         ),
@@ -1349,6 +1592,16 @@ def parse_args() -> argparse.Namespace:
             "OpenHands only: JSON object passed to LLM.litellm_extra_body "
             "(for example, '{\"enable_thinking\": true}'). "
             "In --resume mode, this argument is ignored (uses run_metadata.json)."
+        ),
+    )
+
+    parser.add_argument(
+        "--session-cache",
+        action="store_true",
+        help=(
+            "OpenHands only: enable backend KV-cache session reuse by sending a unique "
+            "X-Session-Id header for each task attempt and releasing it after the run. "
+            "In --resume mode, this flag is ignored and the value from run_metadata.json is used."
         ),
     )
 
@@ -1475,6 +1728,10 @@ def load_resume_config(resume_dir: Path, args: argparse.Namespace) -> Tuple[Infe
         warnings.append(
             "--litellm-extra-body (using 'litellm_extra_body' from metadata)"
         )
+    if getattr(args, "session_cache", False):
+        warnings.append(
+            "--session-cache (using 'session_cache' from metadata)"
+        )
     
     if warnings:
         console.print("[bold yellow]Warning: The following arguments are ignored in resume mode:[/]")
@@ -1547,6 +1804,9 @@ def load_resume_config(resume_dir: Path, args: argparse.Namespace) -> Tuple[Infe
     # Determine litellm_extra_body: always use metadata in resume mode.
     litellm_extra_body = metadata.get("litellm_extra_body")
 
+    # Determine session_cache: always use metadata in resume mode.
+    session_cache = bool(metadata.get("session_cache", False))
+
     # Determine api_key/base_url/version: CLI overrides; otherwise use metadata.
     metadata_api_key = metadata.get("api_key")
     api_key = args.api_key if args.api_key is not None else metadata_api_key
@@ -1576,6 +1836,7 @@ def load_resume_config(resume_dir: Path, args: argparse.Namespace) -> Tuple[Infe
         native_tool_calling=native_tool_calling,
         send_reasoning_content=send_reasoning_content,
         litellm_extra_body=litellm_extra_body,
+        session_cache=session_cache,
         force_timeout=force_timeout,
         force_rerun_ids=_load_force_rerun_ids(getattr(args, "force_rerun", None)),
         api_key=api_key,
@@ -1586,7 +1847,7 @@ def load_resume_config(resume_dir: Path, args: argparse.Namespace) -> Tuple[Infe
     return config, resume_dir
 
 
-def main():
+def main() -> int:
     """Main entry point."""
     args = parse_args()
     config_path = Path(args.config_path).expanduser() if args.config_path else None
@@ -1602,7 +1863,7 @@ def main():
         
         # Run inference in resume mode
         runner = InferenceRunner(config, resume_dir=output_dir, config_path=config_path)
-        runner.run()
+        return runner.run()
     else:
         # Normal mode - validate required arguments
         if args.agent is None:
@@ -1610,6 +1871,9 @@ def main():
             sys.exit(1)
         if args.model is None:
             console.print("[bold red]Error: --model is required (unless using --resume)[/]")
+            sys.exit(1)
+        if getattr(args, "session_cache", False) and args.agent != "openhands":
+            console.print("[bold red]Error: --session-cache is only supported for --agent openhands[/]")
             sys.exit(1)
         
         # Create new config
@@ -1652,6 +1916,7 @@ def main():
                 getattr(args, "litellm_extra_body", None),
                 "--litellm-extra-body",
             ),
+            session_cache=bool(getattr(args, "session_cache", False)),
             force_timeout=bool(getattr(args, "force_timeout", False)),
             force_rerun_ids=_load_force_rerun_ids(getattr(args, "force_rerun", None)),
             api_key=args.api_key,
@@ -1661,8 +1926,8 @@ def main():
         
         # Run inference
         runner = InferenceRunner(config, config_path=config_path)
-        runner.run()
+        return runner.run()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

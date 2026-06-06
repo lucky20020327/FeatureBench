@@ -22,6 +22,8 @@ import json
 import os
 import sys
 import traceback
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +54,63 @@ def _json_object_env(name: str) -> dict[str, Any] | None:
     return parsed
 
 
+def _json_string_map_env(name: str) -> dict[str, str] | None:
+    parsed = _json_object_env(name)
+    if parsed is None:
+        return None
+    return {str(key): str(value) for key, value in parsed.items() if value is not None}
+
+
+def _session_release_url(api_base: str, session_id: str) -> str:
+    base = str(api_base or "").strip().rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    query = urllib.parse.urlencode({"session_id": session_id})
+    return f"{base}/session_release?{query}"
+
+
+def _mark_session_released(session_id: str) -> None:
+    try:
+        marker = Path("/agent-logs/session_release.done")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(session_id, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _release_session(api_base: str | None, session_id: str | None) -> bool:
+    if not api_base or not session_id:
+        return False
+    url = _session_release_url(api_base, session_id)
+    req = urllib.request.Request(url, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+        print(f"Released backend session {session_id}", flush=True)
+        _mark_session_released(session_id)
+        return True
+    except Exception as exc:
+        print(
+            f"Warning: session release failed for {session_id}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+
+
+def _release_llm_session(llm: Any | None) -> None:
+    if llm is None:
+        return
+    headers = getattr(llm, "extra_headers", None)
+    session_id = None
+    if isinstance(headers, dict):
+        session_id = headers.get("X-Session-Id") or headers.get("x-session-id")
+    if not session_id:
+        session_id = _env("LLM_SESSION_ID")
+    api_base = getattr(llm, "base_url", None) or _env("LLM_BASE_URL")
+    _release_session(api_base, session_id)
+
+
 def _install_send_reasoning_content_override(model: str) -> None:
     """Force OpenHands SDK to preserve/send reasoning content for this model."""
     try:
@@ -76,49 +135,78 @@ def _install_send_reasoning_content_override(model: str) -> None:
     try:
         from openhands.sdk.llm.message import Message
 
-        if getattr(Message, "_featurebench_reasoning_alias_patch", False):
-            return
+        if not getattr(Message, "_featurebench_reasoning_alias_patch", False):
+            original = Message.from_llm_chat_message.__func__
 
-        original = Message.from_llm_chat_message.__func__
+            class _ReasoningContentProxy:
+                def __init__(self, wrapped: Any, reasoning_content: str):
+                    self._wrapped = wrapped
+                    self.reasoning_content = reasoning_content
+                    self.reasoning = reasoning_content
 
-        class _ReasoningContentProxy:
-            def __init__(self, wrapped: Any, reasoning_content: str):
-                self._wrapped = wrapped
-                self.reasoning_content = reasoning_content
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._wrapped, name)
 
-            def __getattr__(self, name: str) -> Any:
-                return getattr(self._wrapped, name)
+            def _extract_reasoning_content(message: Any) -> str | None:
+                reasoning = getattr(message, "reasoning_content", None)
+                if reasoning:
+                    return str(reasoning)
 
-        def _extract_reasoning_content(message: Any) -> str | None:
-            reasoning = getattr(message, "reasoning_content", None)
-            if reasoning:
-                return str(reasoning)
+                reasoning = getattr(message, "reasoning", None)
+                if reasoning:
+                    return str(reasoning)
 
-            reasoning = getattr(message, "reasoning", None)
-            if reasoning:
-                return str(reasoning)
+                provider_fields = getattr(message, "provider_specific_fields", None)
+                if isinstance(provider_fields, dict):
+                    for key in ("reasoning_content", "reasoning"):
+                        reasoning = provider_fields.get(key)
+                        if reasoning:
+                            return str(reasoning)
 
-            provider_fields = getattr(message, "provider_specific_fields", None)
-            if isinstance(provider_fields, dict):
-                for key in ("reasoning_content", "reasoning"):
-                    reasoning = provider_fields.get(key)
-                    if reasoning:
-                        return str(reasoning)
+                return None
 
-            return None
+            def patched(cls: type[Message], message: Any) -> Message:
+                if getattr(message, "reasoning_content", None) is None:
+                    reasoning_content = _extract_reasoning_content(message)
+                    if reasoning_content:
+                        message = _ReasoningContentProxy(message, reasoning_content)
+                return original(cls, message)
 
-        def patched(cls: type[Message], message: Any) -> Message:
-            if getattr(message, "reasoning_content", None) is None:
-                reasoning_content = _extract_reasoning_content(message)
-                if reasoning_content:
-                    message = _ReasoningContentProxy(message, reasoning_content)
-            return original(cls, message)
-
-        Message.from_llm_chat_message = classmethod(patched)
-        setattr(Message, "_featurebench_reasoning_alias_patch", True)
+            Message.from_llm_chat_message = classmethod(patched)
+            setattr(Message, "_featurebench_reasoning_alias_patch", True)
     except Exception as exc:
         print(
             f"Warning: failed to install reasoning field alias patch: {exc}",
+            file=sys.stderr,
+        )
+
+    try:
+        from openhands.sdk.llm.message import Message
+
+        if getattr(Message, "_featurebench_reasoning_send_alias_patch", False):
+            return
+
+        original_to_chat_dict = Message.to_chat_dict
+
+        def patched_to_chat_dict(
+            self: Message, *args: Any, **kwargs: Any
+        ) -> dict[str, Any]:
+            message_dict = original_to_chat_dict(self, *args, **kwargs)
+            reasoning_content = message_dict.get("reasoning_content")
+            reasoning = message_dict.get("reasoning")
+
+            if reasoning_content and not reasoning:
+                message_dict["reasoning"] = reasoning_content
+            elif reasoning and not reasoning_content:
+                message_dict["reasoning_content"] = reasoning
+
+            return message_dict
+
+        Message.to_chat_dict = patched_to_chat_dict
+        setattr(Message, "_featurebench_reasoning_send_alias_patch", True)
+    except Exception as exc:
+        print(
+            f"Warning: failed to install reasoning send alias patch: {exc}",
             file=sys.stderr,
         )
 
@@ -165,6 +253,104 @@ def _event_to_trajectory_record(index: int, event: Any) -> dict[str, Any]:
         "action": action,
         "args": data,
     }
+
+
+def _text_preview(value: Any, max_chars: int = 2000) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                if item.get("text"):
+                    parts.append(str(item.get("text")))
+                elif item.get("type") and item.get("content"):
+                    parts.append(str(item.get("content")))
+            else:
+                parts.append(str(item))
+        text = "\n".join(parts)
+    elif isinstance(value, dict):
+        text = json.dumps(value, ensure_ascii=False)
+    else:
+        text = str(value)
+
+    if len(text) > max_chars:
+        return text[:max_chars] + "... [truncated]"
+    return text
+
+
+def _event_live_detail(data: dict[str, Any], event_type: str) -> str:
+    if event_type == "ActionEvent":
+        action = data.get("action")
+        if isinstance(action, dict):
+            tool_name = data.get("tool_name")
+            if tool_name == "terminal":
+                return _text_preview(action.get("command"), 2000)
+            if tool_name == "file_editor":
+                command = action.get("command") or ""
+                path = action.get("path") or ""
+                return _text_preview(f"{command} {path}".strip(), 2000)
+            return _text_preview(action, 2000)
+        return _text_preview(action, 2000)
+
+    if event_type == "ObservationEvent":
+        observation = data.get("observation")
+        if isinstance(observation, dict):
+            return _text_preview(observation.get("content"), 2000)
+        return _text_preview(observation, 2000)
+
+    return _text_preview(
+        data.get("message")
+        or data.get("detail")
+        or data.get("content")
+        or data.get("thought")
+        or "",
+        2000,
+    )
+
+
+def _print_live_event(index: int, event: Any) -> None:
+    data = _event_data(event)
+    event_type = event.__class__.__name__
+    timestamp = data.get("timestamp") or ""
+
+    if event_type == "ActionEvent":
+        tool_name = data.get("tool_name") or "action"
+        summary = data.get("summary") or ""
+        detail = _event_live_detail(data, event_type)
+        print(
+            f"\n[FeatureBench live #{index} {timestamp}] agent {tool_name}"
+            f"{f' - {summary}' if summary else ''}\n{detail}",
+            flush=True,
+        )
+        return
+
+    if event_type == "ObservationEvent":
+        tool_name = data.get("tool_name") or "observe"
+        observation = data.get("observation")
+        exit_code = None
+        is_error = None
+        if isinstance(observation, dict):
+            is_error = observation.get("is_error")
+            metadata = observation.get("metadata")
+            if isinstance(metadata, dict):
+                exit_code = metadata.get("exit_code")
+        detail = _event_live_detail(data, event_type)
+        print(
+            f"\n[FeatureBench live #{index} {timestamp}] environment {tool_name}"
+            f" exit={exit_code} error={is_error}\n{detail}",
+            flush=True,
+        )
+        return
+
+    if event_type in {"AgentErrorEvent", "ConversationErrorEvent", "UserRejectObservation"}:
+        detail = _event_live_detail(data, event_type)
+        print(
+            f"\n[FeatureBench live #{index} {timestamp}] error {event_type}\n{detail}",
+            flush=True,
+        )
 
 
 def _write_trajectory(path: Path, events: list[Any], status: str) -> None:
@@ -220,6 +406,13 @@ def _build_llm() -> Any:
     api_key = _env("LLM_API_KEY")
     if api_key:
         kwargs["api_key"] = SecretStr(api_key)
+
+    extra_headers = _json_string_map_env("LLM_EXTRA_HEADERS") or {}
+    session_id = _env("LLM_SESSION_ID")
+    if session_id:
+        extra_headers["X-Session-Id"] = session_id
+    if extra_headers:
+        kwargs["extra_headers"] = extra_headers
 
     optional_string_fields = {
         "base_url": "LLM_BASE_URL",
@@ -279,6 +472,7 @@ def main() -> int:
         _env("SAVE_TRAJECTORY_PATH") or "/agent-logs/trajectory.json"
     )
     events: list[Any] = []
+    llm: Any | None = None
 
     try:
         from openhands.sdk import Conversation
@@ -291,7 +485,15 @@ def main() -> int:
         agent = _build_agent(llm)
 
         def _record_event(event: Any) -> None:
+            event_index = len(events)
             events.append(event)
+            try:
+                _print_live_event(event_index, event)
+            except Exception as exc:
+                print(
+                    f"Warning: failed to mirror live OpenHands event {event_index}: {exc}",
+                    file=sys.stderr,
+                )
 
         conversation = Conversation(
             agent=agent,
@@ -329,6 +531,8 @@ def main() -> int:
         except Exception:
             pass
         return 1
+    finally:
+        _release_llm_session(llm)
 
 
 if __name__ == "__main__":
@@ -336,8 +540,43 @@ if __name__ == "__main__":
 '''
 
 
+def _session_release_url(api_base: str, session_id: str) -> str:
+    import urllib.parse
+
+    base = str(api_base or "").strip().rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    query = urllib.parse.urlencode({"session_id": session_id})
+    return f"{base}/session_release?{query}"
+
+
+def _release_backend_session(
+    api_base: Optional[str],
+    session_id: Optional[str],
+    logger,
+) -> bool:
+    import urllib.request
+
+    if not api_base or not session_id:
+        return False
+
+    url = _session_release_url(api_base, session_id)
+    req = urllib.request.Request(url, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+        if logger:
+            logger.info(f"Released backend session {session_id}")
+        return True
+    except Exception as e:
+        if logger:
+            logger.warning(f"Session release failed for {session_id}: {e}")
+        return False
+
+
 class OpenHandsAgent(BaseAgent):
     """OpenHands agent for FeatureBench inference."""
+    SESSION_RELEASE_MARKER = "/agent-logs/session_release.done"
     
     @property
     def name(self) -> str:
@@ -531,7 +770,9 @@ echo 'export LLM_LOG_COMPLETIONS_FOLDER=/agent-logs/completions' >> ~/.bashrc
             "echo '/opt/openhands-venv/bin/python not found' >&2; exit 127; "
             "fi; "
             "if { [[ \"${LLM_SEND_REASONING_CONTENT,,}\" =~ ^(1|true|yes|on)$ ]] || "
-            "[ -n \"${LLM_LITELLM_EXTRA_BODY:-}\" ]; } && "
+            "[ -n \"${LLM_LITELLM_EXTRA_BODY:-}\" ] || "
+            "[ -n \"${LLM_SESSION_ID:-}\" ] || "
+            "[ -n \"${LLM_EXTRA_HEADERS:-}\" ]; } && "
             "/opt/openhands-venv/bin/python -c "
             "\"import importlib.util, sys; "
             "sys.exit(0 if importlib.util.find_spec('openhands.sdk') else 1)\"; "
@@ -580,10 +821,14 @@ echo 'export LLM_LOG_COMPLETIONS_FOLDER=/agent-logs/completions' >> ~/.bashrc
             "LLM_REASONING_EFFORT": self.env_vars.get("LLM_REASONING_EFFORT"),
             # Configure native tool calling (OpenHands LLMConfig.native_tool_calling via LLM_ env mapping)
             "LLM_NATIVE_TOOL_CALLING": self.env_vars.get("LLM_NATIVE_TOOL_CALLING"),
-            # Force OpenHands SDK to send prior assistant reasoning_content in history.
+            # Force OpenHands SDK to send prior assistant reasoning aliases in history.
             "LLM_SEND_REASONING_CONTENT": self.env_vars.get("LLM_SEND_REASONING_CONTENT"),
             # Extra JSON body passed to LiteLLM/OpenAI-compatible backends.
             "LLM_LITELLM_EXTRA_BODY": self.env_vars.get("LLM_LITELLM_EXTRA_BODY"),
+            # Extra headers passed to LiteLLM/OpenAI-compatible backends.
+            "LLM_EXTRA_HEADERS": self.env_vars.get("LLM_EXTRA_HEADERS"),
+            # Optional backend session id; normally generated per task attempt.
+            "LLM_SESSION_ID": self.env_vars.get("LLM_SESSION_ID"),
             # Disable features not needed for FeatureBench
             "AGENT_ENABLE_PROMPT_EXTENSIONS": "false",
             "AGENT_ENABLE_BROWSING": "false",
@@ -618,6 +863,62 @@ echo 'export LLM_LOG_COMPLETIONS_FOLDER=/agent-logs/completions' >> ~/.bashrc
         lines.extend(self._get_proxy_unset_lines())
 
         return "\n".join(lines)
+
+    def _read_container_env(self, container, name: str) -> Optional[str]:
+        try:
+            exit_code, output = container.exec_run(
+                ["bash", "-lc", f"printf '%s' \"${{{name}:-}}\""]
+            )
+            if exit_code != 0:
+                return None
+            value = output.decode("utf-8", errors="replace").strip()
+            return value or None
+        except Exception as e:
+            self.logger.warning(f"Failed to read container env {name}: {e}")
+            return None
+
+    def _session_release_done(self, container) -> bool:
+        try:
+            exit_code, _ = container.exec_run(
+                ["bash", "-lc", f"test -f {self.SESSION_RELEASE_MARKER}"]
+            )
+            return exit_code == 0
+        except Exception:
+            return False
+
+    def _mark_session_released(self, container, session_id: str) -> None:
+        try:
+            safe_session_id = session_id.replace("'", "'\\''")
+            container.exec_run(
+                [
+                    "bash",
+                    "-lc",
+                    (
+                        "mkdir -p /agent-logs && "
+                        f"printf '%s' '{safe_session_id}' > {self.SESSION_RELEASE_MARKER}"
+                    ),
+                ]
+            )
+        except Exception as e:
+            self.logger.warning(f"Failed to mark backend session released: {e}")
+
+    def _release_session_from_container_env(self, container) -> None:
+        if self._session_release_done(container):
+            return
+
+        session_id = self._read_container_env(container, "LLM_SESSION_ID")
+        if not session_id:
+            return
+
+        api_base = self._read_container_env(container, "LLM_BASE_URL")
+        if not api_base:
+            api_base = self.env_vars.get("LLM_BASE_URL")
+
+        if _release_backend_session(api_base, session_id, self.logger):
+            self._mark_session_released(container, session_id)
+
+    def failure_hook(self, container, log_file) -> None:
+        self._release_session_from_container_env(container)
 
     def prepare_run(self, container, instruction: str, log_file) -> bool:
         """Copy the task prompt into the container without putting it in argv."""
@@ -1092,6 +1393,7 @@ EOF""",
         # Determine the destination path for trajectory.json and completions directory
         log_dir = Path(log_file).parent
         infer_log_path = log_dir / "infer.log"
+        self._release_session_from_container_env(container)
         if infer_log_path.exists():
             mode = str(self.env_vars.get("INFER_LOG_RENDER_MODE", "full")).lower()
             md, html_doc = render_infer_log(infer_log_path, mode=mode)
