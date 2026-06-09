@@ -132,4 +132,4 @@ If you found FeatureBench useful, please cite us as:
 
 ## 📧 Contact
 
-If you have any questions, feel free to contact [qixingzhou1125@gmail.com](mailto:qixingzhou1125@gmail.com) or [zjcheng2022@gmail.com](mailto:zjcheng2022@gmail.com).
+If you have any questions, feel free to contact [zhouqixing@stu.cqu.edu.cn](mailto:zhouqixing@stu.cqu.edu.cn) or [zjcheng2022@gmail.com](mailto:zjcheng2022@gmail.com).
