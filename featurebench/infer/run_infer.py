@@ -883,8 +883,24 @@ class InferenceRunner:
                 timeout=self.config.timeout
             )
             
-            # if not agent_success, raise an exception and will not save patch
+            # if not agent_success, raise an exception and try to save patch
             if not agent_success:
+                result.error = "Agent did not complete successfully"
+                task_logger.warning(
+                    f"{self.config.agent} did not complete successfully; attempting to generate patch"
+                )
+                patch = runtime_handler.complete_runtime(container, instance, log_file)
+
+                if patch is None:
+                    raise RuntimeError(
+                        "Agent did not complete successfully; failed to generate patch"
+                    )
+                else:
+                    result.model_patch = patch
+                    self.output_manager.save_patch(task_paths, patch)
+                    task_logger.warning(
+                        f"Saved patch for failed run"
+                    )
                 raise RuntimeError(f"Agent did not complete successfully")
             
             # Complete runtime and get patch
