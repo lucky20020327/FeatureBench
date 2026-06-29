@@ -67,12 +67,15 @@ class RuntimeHandler:
             self.logger.info("Installing tmux and asciinema...")
             exit_code, _ = self.cm.exec_command(
                 container,
+                "chmod -R a+rX /etc/apt/trusted.gpg.d /etc/apt/keyrings "
+                "/usr/share/keyrings 2>/dev/null || true; "
                 "apt-get update && apt-get install -y tmux asciinema",
                 log_file=log_file
             )
             if exit_code != 0:
-                self.logger.error("Failed to install tmux and asciinema")
-                return False
+                self.logger.warning(
+                    "Failed to install tmux and asciinema; continuing without them"
+                )
 
             # Set instance ID and configure git
             exit_code, _ = self.cm.exec_command(

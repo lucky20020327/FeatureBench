@@ -608,17 +608,26 @@ set -e
 
 echo "Installing OpenHands agent..."
 
-# Update package manager
-apt-get update
-apt-get install -y curl git build-essential python3-pip python3-venv
+# Install system dependencies only when the image does not already provide them.
+if command -v curl >/dev/null && command -v git >/dev/null && command -v gcc >/dev/null && command -v make >/dev/null && python3 -m venv /tmp/openhands-venv-check >/dev/null 2>&1; then
+    rm -rf /tmp/openhands-venv-check
+    echo "System dependencies already available; skipping apt-get"
+else
+    rm -rf /tmp/openhands-venv-check
+    apt-get update
+    apt-get install -y curl git build-essential python3-pip python3-venv
+fi
 
 CACHE_ROOT="${{AGENT_DOWNLOAD_CACHE:-/download}}"
 mkdir -p "$CACHE_ROOT" "$CACHE_ROOT/uv" "$CACHE_ROOT/pip" "$CACHE_ROOT/uv/python-mirror"
 
 export PIP_CACHE_DIR="$CACHE_ROOT/pip"
+export PIP_PROGRESS_BAR=off
 export UV_CACHE_DIR="$CACHE_ROOT/uv"
 UV_PYTHON_MIRROR_DIR="$CACHE_ROOT/uv/python-mirror"
 PYTHON_INSTALL_MIRROR="${{UV_PYTHON_INSTALL_MIRROR:-https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download}}"
+PRIMARY_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/"
+FALLBACK_INDEX_URL="${{UV_FALLBACK_INDEX_URL:-https://pypi.org/simple/}}"
 
 UV_DIR="/opt/featurebench/uv"
 UV_BIN_PRIMARY="$UV_DIR/bin/uv"
@@ -629,24 +638,33 @@ VENV_DIR="/opt/openhands-venv"
 
 # Install uv if missing
 mkdir -p "$UV_DIR"
-if [ ! -x "$UV_BIN_PRIMARY" ] && [ ! -x "$UV_BIN_ALT" ]; then
-    export PIPX_HOME="$UV_DIR/pipx"
-    export PIPX_BIN_DIR="$UV_DIR/bin"
+if [ ! -f "$UV_BIN_PRIMARY" ] && [ ! -f "$UV_BIN_ALT" ]; then
     PIPX_VENV="$UV_DIR/pipx-venv"
-    mkdir -p "$PIPX_HOME" "$PIPX_BIN_DIR"
-    # Create an isolated venv for pipx itself so it doesn't import the container's global packaging.
+    mkdir -p "$UV_DIR/bin"
+    # Create an isolated venv for uv so it doesn't import the container's global packaging.
     python3 -m venv "$PIPX_VENV"
-    "$PIPX_VENV/bin/python" -m pip install --upgrade pip pipx
-    "$PIPX_VENV/bin/python" -m pipx ensurepath --force
-    source ~/.bashrc 2>/dev/null || true
-    # Install uv into a pipx-managed venv.
-    "$PIPX_VENV/bin/python" -m pipx install uv
+    "$PIPX_VENV/bin/python" -m pip install --progress-bar off --upgrade pip
+    "$PIPX_VENV/bin/python" -m pip install --progress-bar off --index-url "$PRIMARY_INDEX_URL" uv || \
+        "$PIPX_VENV/bin/python" -m pip install --progress-bar off --index-url "$FALLBACK_INDEX_URL" uv
+    UV_CANDIDATE="$PIPX_VENV/bin/uv"
+    if [ ! -f "$UV_CANDIDATE" ]; then
+        UV_CANDIDATE="$(find "$PIPX_VENV" -type f -name uv | head -n 1)"
+    fi
+    if [ -z "$UV_CANDIDATE" ] || [ ! -f "$UV_CANDIDATE" ]; then
+        echo "Installed uv package but no uv executable was found under $PIPX_VENV" >&2
+        find "$PIPX_VENV" -maxdepth 3 -type f -name 'uv*' -print >&2
+        exit 1
+    fi
+    chmod +x "$UV_CANDIDATE"
+    rm -f "$UV_BIN_PRIMARY"
+    cp "$UV_CANDIDATE" "$UV_BIN_PRIMARY"
+    chmod +x "$UV_BIN_PRIMARY"
 fi
 
 # Select uv binary
-if [ -x "$UV_BIN_PRIMARY" ]; then
+if [ -f "$UV_BIN_PRIMARY" ]; then
     UV_BIN="$UV_BIN_PRIMARY"
-elif [ -x "$UV_BIN_ALT" ]; then
+elif [ -f "$UV_BIN_ALT" ]; then
     UV_BIN="$UV_BIN_ALT"
 else
     echo "uv not found after install" >&2
@@ -664,9 +682,6 @@ python-install-mirror = "$PYTHON_INSTALL_MIRROR"
 url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/"
 default = true
 EOF
-
-PRIMARY_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/"
-FALLBACK_INDEX_URL="${{UV_FALLBACK_INDEX_URL:-https://pypi.org/simple/}}"
 
 uv_pip_install_with_fallback() {{
     if "$UV_BIN" pip install --index-url "$PRIMARY_INDEX_URL" "$@"; then

@@ -27,6 +27,16 @@ ANSI_ESCAPE_PATTERN = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07')
 DOCKER_HOST_GATEWAY = "172.17.0.1"
 
 
+def docker_api_at_least(client: docker.DockerClient, major: int, minor: int) -> bool:
+    """Return whether the Docker server API supports a requested version."""
+    try:
+        version = str(client.version().get("ApiVersion", "0.0"))
+        current_major, current_minor, *_ = [int(part) for part in version.split(".")]
+        return (current_major, current_minor) >= (major, minor)
+    except Exception:
+        return False
+
+
 def strip_ansi_codes(text: str) -> str:
     """Remove ANSI escape sequences from text."""
     return ANSI_ESCAPE_PATTERN.sub('', text)
@@ -233,22 +243,30 @@ class ContainerManager:
                     pass
         
         try:
-            container = self.client.containers.run(
-                image=image_name,
-                name=container_name,
-                detach=True,
-                tty=True,
-                stdin_open=True,
-                working_dir=working_dir,
-                environment=env_list,
-                volumes=volumes,
-                command="tail -f /dev/null",  # Keep container running
-                platform="linux/amd64",
-                network_mode="host" if use_host_network else "bridge",
-                device_requests=device_requests,
-                shm_size=shm_size,
-                labels=labels,
-            )
+            run_kwargs = {
+                "image": image_name,
+                "name": container_name,
+                "detach": True,
+                "tty": True,
+                "stdin_open": True,
+                "working_dir": working_dir,
+                "environment": env_list,
+                "volumes": volumes,
+                "user": "root",
+                "command": "tail -f /dev/null",  # Keep container running
+                "network_mode": "host" if use_host_network else "bridge",
+                "device_requests": device_requests,
+                "shm_size": shm_size,
+                "labels": labels,
+            }
+            if docker_api_at_least(self.client, 1, 41):
+                run_kwargs["platform"] = "linux/amd64"
+            else:
+                self.logger.info(
+                    "Docker API < 1.41 detected; creating container without platform parameter"
+                )
+
+            container = self.client.containers.run(**run_kwargs)
             
             # Check if GPU is available
             if need_gpu:

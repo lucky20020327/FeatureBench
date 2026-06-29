@@ -104,9 +104,14 @@ def _block_to_html(block: LogBlock) -> str:
     title = name or block.kind
     if block.action_id is not None:
         title = f"{title} #{block.action_id}"
+    action_attr = (
+        ""
+        if block.action_id is None
+        else f' data-action-id="{block.action_id}"'
+    )
     return (
         f"<details class='block {kind_cls} {name_cls}'"
-        f"{'' if block.action_id is None else f' data-action-id=\"{block.action_id}\"'}>"
+        f"{action_attr}>"
         f"<summary class='block-title'>"
         f"<div class='title-row'>"
         f"<span class='block-kind'>{_escape(title)}</span>"
