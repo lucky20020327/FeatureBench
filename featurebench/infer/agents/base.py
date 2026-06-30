@@ -425,3 +425,23 @@ class BaseAgent(ABC):
                 f.write("\n" + "=" * 60 + "\n")
                 f.write(f"END Agent Execution: {self.name}\n")
                 f.write("=" * 60 + "\n\n")
+
+    def run_with_sandbox(
+        self,
+        controller_container: Container,
+        sandbox_container: Container,
+        instruction: str,
+        log_file: Path,
+        timeout: Optional[int] = None,
+    ) -> bool:
+        """Run an agent installed in one container against a separate sandbox.
+
+        Agents that do not implement an out-of-process sandbox can keep using the
+        historical single-container behavior by ignoring ``sandbox_container``.
+        """
+        return self.run(
+            controller_container,
+            instruction,
+            log_file,
+            timeout=timeout,
+        )

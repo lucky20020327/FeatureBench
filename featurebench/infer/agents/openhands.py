@@ -18,14 +18,18 @@ _OPENHANDS_SDK_RUNNER_SCRIPT = r'''#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
+import re
+import shlex
 import sys
+import tarfile
 import traceback
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import SecretStr
 
@@ -590,11 +594,514 @@ def _build_llm() -> Any:
     return LLM(**kwargs)
 
 
+def _docker_client() -> Any:
+    try:
+        import docker
+    except Exception as exc:
+        raise RuntimeError(
+            "Sandbox proxy requires the docker Python package in the controller."
+        ) from exc
+    return docker.from_env()
+
+
+def _sandbox_container() -> Any:
+    sandbox_id = _env("SANDBOX_CONTAINER_ID")
+    if not sandbox_id:
+        raise RuntimeError("SANDBOX_CONTAINER_ID is not set for sandbox proxy tools.")
+    return _docker_client().containers.get(sandbox_id)
+
+
+def _combine_exec_output(output: Any) -> str:
+    if isinstance(output, tuple):
+        stdout, stderr = output
+        data = (stdout or b"") + (stderr or b"")
+    else:
+        data = output or b""
+    if isinstance(data, str):
+        return data
+    return data.decode("utf-8", errors="replace")
+
+
+def _make_transfer_archive(files: dict[str, bytes]) -> bytes:
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w") as tar:
+        for name, content in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    stream.seek(0)
+    return stream.read()
+
+
+def _register_sandbox_tools() -> None:
+    from openhands.sdk.tool import (
+        Action,
+        DeclaredResources,
+        ToolAnnotations,
+        ToolDefinition,
+        ToolExecutor,
+        register_tool,
+    )
+    from openhands.tools.file_editor.definition import (
+        FileEditorAction,
+        FileEditorObservation,
+        TOOL_DESCRIPTION,
+    )
+    from openhands.tools.task_tracker import TaskTrackerTool  # noqa: F401
+    from openhands.tools.terminal.definition import (
+        TerminalAction,
+        TerminalObservation,
+    )
+    from openhands.tools.terminal.descriptions import UNIX_TOOL_DESCRIPTION
+    from openhands.tools.terminal.metadata import CmdOutputMetadata
+
+    class SandboxTerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
+        def __init__(self) -> None:
+            self.container_id = _env("SANDBOX_CONTAINER_ID") or ""
+            self.cwd = _env("SANDBOX_WORKSPACE") or "/testbed"
+
+        def _reject_if_forbidden(self, command: str) -> str | None:
+            lowered = command.lower()
+            blocked_tokens = (
+                "docker ",
+                "docker\t",
+                "docker\n",
+                "nsenter",
+                "/var/run/docker.sock",
+                "/opt/openhands-venv",
+                "/installed-agent",
+                "/agent-logs",
+            )
+            for token in blocked_tokens:
+                if token in lowered:
+                    return (
+                        "Command rejected by FeatureBench sandbox policy: "
+                        f"access to {token.strip()} is not allowed."
+                    )
+            return None
+
+        def __call__(
+            self,
+            action: TerminalAction,
+            conversation: Any | None = None,  # noqa: ARG002
+        ) -> TerminalObservation:
+            if not self.container_id:
+                return TerminalObservation.from_text(
+                    "SANDBOX_CONTAINER_ID is not configured.",
+                    command=action.command,
+                    exit_code=127,
+                    timeout=False,
+                    metadata=CmdOutputMetadata(
+                        exit_code=127,
+                        working_dir=self.cwd,
+                    ),
+                    is_error=True,
+                )
+            if action.is_input:
+                return TerminalObservation.from_text(
+                    "Interactive input is not supported by the isolated sandbox proxy.",
+                    command=action.command,
+                    exit_code=2,
+                    timeout=False,
+                    metadata=CmdOutputMetadata(exit_code=2, working_dir=self.cwd),
+                    is_error=True,
+                )
+            if action.reset:
+                self.cwd = _env("SANDBOX_WORKSPACE") or "/testbed"
+            rejection = self._reject_if_forbidden(action.command)
+            if rejection:
+                return TerminalObservation.from_text(
+                    rejection,
+                    command=action.command,
+                    exit_code=126,
+                    timeout=False,
+                    metadata=CmdOutputMetadata(exit_code=126, working_dir=self.cwd),
+                    is_error=True,
+                )
+
+            container = _sandbox_container()
+            safe_cwd = shlex.quote(self.cwd)
+            marker = "__FEATUREBENCH_SANDBOX_METADATA__"
+            command = action.command or "pwd"
+            wrapped = f"""
+cd {safe_cwd} 2>/dev/null || cd /testbed || exit 125
+(source ~/.bashrc >/dev/null 2>&1 || true)
+(conda activate testbed >/dev/null 2>&1 || true)
+{command}
+__fb_exit=$?
+FB_EXIT_CODE=$__fb_exit python - <<'PY'
+import json
+import os
+import shutil
+print("{marker}" + json.dumps({{
+    "exit_code": int(os.environ.get("FB_EXIT_CODE", "0")),
+    "working_dir": os.getcwd(),
+    "py_interpreter_path": shutil.which("python") or "",
+}}))
+PY
+exit $__fb_exit
+"""
+            try:
+                result = container.exec_run(
+                    ["bash", "-lc", wrapped],
+                    demux=True,
+                    workdir=self.cwd if self.cwd.startswith("/") else "/testbed",
+                    stdout=True,
+                    stderr=True,
+                    stream=False,
+                )
+                output = _combine_exec_output(result.output)
+                exit_code = int(result.exit_code)
+                timed_out = False
+            except Exception as exc:
+                output = f"Sandbox command execution failed: {exc}"
+                exit_code = -1
+                timed_out = True
+
+            metadata = {
+                "exit_code": exit_code,
+                "working_dir": self.cwd,
+                "py_interpreter_path": "",
+            }
+            if marker in output:
+                before, _, after = output.rpartition(marker)
+                output = before.rstrip("\n")
+                first_line = after.splitlines()[0] if after.splitlines() else "{}"
+                try:
+                    metadata.update(json.loads(first_line))
+                except Exception:
+                    pass
+            self.cwd = str(metadata.get("working_dir") or self.cwd)
+            cmd_metadata = CmdOutputMetadata(
+                exit_code=int(metadata.get("exit_code", exit_code)),
+                working_dir=self.cwd,
+                py_interpreter_path=str(metadata.get("py_interpreter_path") or ""),
+                suffix=f"\n[Command finished with exit code {exit_code}.]",
+            )
+            return TerminalObservation.from_text(
+                output,
+                command=action.command,
+                exit_code=exit_code,
+                timeout=timed_out,
+                metadata=cmd_metadata,
+                is_error=exit_code not in (0, -1),
+            )
+
+    class SandboxTerminalTool(ToolDefinition[TerminalAction, TerminalObservation]):
+        name: ClassVar[str] = "terminal"
+
+        def declared_resources(self, action: Action) -> DeclaredResources:  # noqa: ARG002
+            return DeclaredResources(keys=("terminal:sandbox",), declared=True)
+
+        @classmethod
+        def create(cls, conv_state: Any, **params: Any) -> list["SandboxTerminalTool"]:  # noqa: ARG003
+            return [
+                cls(
+                    action_type=TerminalAction,
+                    observation_type=TerminalObservation,
+                    description=UNIX_TOOL_DESCRIPTION
+                    + "\n\nThis terminal executes inside the isolated FeatureBench sandbox. "
+                    + "It cannot access the OpenHands controller environment, /opt/openhands-venv, "
+                    + "or Docker control sockets.",
+                    annotations=ToolAnnotations(
+                        title="terminal",
+                        readOnlyHint=False,
+                        destructiveHint=True,
+                        idempotentHint=False,
+                        openWorldHint=False,
+                    ),
+                    executor=SandboxTerminalExecutor(),
+                )
+            ]
+
+    class SandboxFileEditorExecutor(ToolExecutor[FileEditorAction, FileEditorObservation]):
+        _SCRIPT = r"""
+import json
+import os
+import pathlib
+import shutil
+import sys
+
+ROOT = pathlib.Path("/testbed").resolve()
+
+def fail(message, **extra):
+    out = {"ok": False, "message": message}
+    out.update(extra)
+    print(json.dumps(out))
+    raise SystemExit(0)
+
+def safe_path(raw):
+    if not raw or not str(raw).startswith("/"):
+        fail("Path must be absolute and under /testbed.", path=raw)
+    path = pathlib.Path(raw)
+    probe = path if path.exists() else path.parent
+    try:
+        resolved_probe = probe.resolve(strict=False)
+    except Exception as exc:
+        fail(f"Failed to resolve path {raw}: {exc}", path=raw)
+    if resolved_probe != ROOT and ROOT not in resolved_probe.parents:
+        fail(f"Path {raw} escapes the /testbed sandbox.", path=raw)
+    return path
+
+def read_text(path):
+    return path.read_text(encoding="utf-8", errors="replace")
+
+def write_text(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+def render_view(path, view_range):
+    if path.is_dir():
+        rows = []
+        base_depth = len(path.parts)
+        for child in sorted(path.rglob("*")):
+            rel = child.relative_to(path)
+            if len(child.parts) - base_depth > 2:
+                continue
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            suffix = "/" if child.is_dir() else ""
+            rows.append(str(path / rel) + suffix)
+            if len(rows) >= 200:
+                rows.append("<response clipped>")
+                break
+        return "Here's the files and directories up to 2 levels deep in " + str(path) + ":\n" + "\n".join(rows)
+    if not path.exists():
+        fail(f"The path {path} does not exist.", path=str(path))
+    text = read_text(path)
+    lines = text.splitlines()
+    start = 1
+    end = len(lines)
+    if view_range:
+        start = max(int(view_range[0]), 1)
+        if len(view_range) > 1 and int(view_range[1]) != -1:
+            end = min(int(view_range[1]), len(lines))
+    rendered = [f"{idx:6}\t{line}" for idx, line in enumerate(lines[start - 1:end], start)]
+    return "Here's the result of running `cat -n` on " + str(path) + ":\n" + "\n".join(rendered)
+
+request_path = pathlib.Path(sys.argv[1])
+req = json.loads(request_path.read_text(encoding="utf-8"))
+command = req.get("command")
+path = safe_path(req.get("path"))
+
+if command == "view":
+    print(json.dumps({"ok": True, "message": render_view(path, req.get("view_range")), "path": str(path)}))
+elif command == "create":
+    if path.exists():
+        fail(f"File already exists at: {path}", path=str(path))
+    file_text = req.get("file_text")
+    if file_text is None:
+        fail("Missing required parameter: file_text", path=str(path))
+    write_text(path, file_text)
+    print(json.dumps({"ok": True, "message": f"File created successfully at: {path}", "path": str(path), "prev_exist": False, "old_content": None, "new_content": file_text}))
+elif command == "str_replace":
+    if not path.exists():
+        fail(f"The path {path} does not exist.", path=str(path))
+    old = req.get("old_str")
+    new = req.get("new_str")
+    if old is None or new is None:
+        fail("Missing required parameters: old_str and new_str", path=str(path))
+    old_content = read_text(path)
+    count = old_content.count(old)
+    if count == 0:
+        fail(f"No replacement was performed, old_str did not appear verbatim in {path}.", path=str(path))
+    if count > 1:
+        fail(f"No replacement was performed. Multiple occurrences of old_str in {path}.", path=str(path))
+    new_content = old_content.replace(old, new, 1)
+    write_text(path, new_content)
+    print(json.dumps({"ok": True, "message": "The file has been edited.", "path": str(path), "prev_exist": True, "old_content": old_content, "new_content": new_content}))
+elif command == "insert":
+    if not path.exists():
+        fail(f"The path {path} does not exist.", path=str(path))
+    insert_line = req.get("insert_line")
+    new = req.get("new_str")
+    if insert_line is None or new is None:
+        fail("Missing required parameters: insert_line and new_str", path=str(path))
+    old_content = read_text(path)
+    lines = old_content.splitlines(True)
+    idx = int(insert_line)
+    if idx < 0 or idx > len(lines):
+        fail(f"insert_line {idx} is outside the file range.", path=str(path))
+    if idx == 0:
+        new_content = new + old_content
+    else:
+        prefix = "".join(lines[:idx])
+        suffix = "".join(lines[idx:])
+        if prefix and not prefix.endswith("\n") and not new.startswith("\n"):
+            new = "\n" + new
+        new_content = prefix + new + suffix
+    write_text(path, new_content)
+    print(json.dumps({"ok": True, "message": "The file has been edited.", "path": str(path), "prev_exist": True, "old_content": old_content, "new_content": new_content}))
+else:
+    fail(f"Unsupported file_editor command: {command}", path=str(path))
+"""
+
+        def __init__(self) -> None:
+            self.container_id = _env("SANDBOX_CONTAINER_ID") or ""
+            self.history: dict[str, list[str | None]] = {}
+
+        def _run_script(self, payload: dict[str, Any]) -> dict[str, Any]:
+            if not self.container_id:
+                return {"ok": False, "message": "SANDBOX_CONTAINER_ID is not configured."}
+            container = _sandbox_container()
+            transfer_dir = f"/tmp/fb_tool_{os.getpid()}_{id(payload)}"
+            request = json.dumps(payload).encode("utf-8")
+            script = self._SCRIPT.encode("utf-8")
+            archive = _make_transfer_archive(
+                {
+                    "request.json": request,
+                    "sandbox_file_editor.py": script,
+                }
+            )
+            container.exec_run(["mkdir", "-p", transfer_dir])
+            container.put_archive(transfer_dir, archive)
+            try:
+                result = container.exec_run(
+                    [
+                        "bash",
+                        "-lc",
+                        f"python3 {transfer_dir}/sandbox_file_editor.py {transfer_dir}/request.json "
+                        f"|| python {transfer_dir}/sandbox_file_editor.py {transfer_dir}/request.json",
+                    ],
+                    demux=True,
+                )
+                output = _combine_exec_output(result.output).strip()
+                if not output:
+                    return {
+                        "ok": False,
+                        "message": f"sandbox file editor produced no output (exit {result.exit_code})",
+                    }
+                return json.loads(output.splitlines()[-1])
+            except Exception as exc:
+                return {"ok": False, "message": f"Sandbox file editor failed: {exc}"}
+            finally:
+                container.exec_run(["rm", "-rf", transfer_dir])
+
+        def _write_undo_content(self, path: str, content: str | None) -> FileEditorObservation:
+            payload = {"command": "view", "path": path}
+            resolved = self._run_script(payload)
+            old_content = None
+            if content is None:
+                container = _sandbox_container()
+                container.exec_run(["rm", "-f", path])
+                return FileEditorObservation.from_text(
+                    f"Undid creation of {path}.",
+                    command="undo_edit",
+                    path=path,
+                    old_content=None,
+                    new_content=None,
+                )
+            edit_payload = {
+                "command": "str_replace",
+                "path": path,
+                "old_str": "",
+                "new_str": content,
+            }
+            container = _sandbox_container()
+            transfer_dir = f"/tmp/fb_undo_{os.getpid()}_{abs(hash(path))}"
+            archive = _make_transfer_archive({"undo.txt": content.encode("utf-8")})
+            container.exec_run(["mkdir", "-p", transfer_dir])
+            container.put_archive(transfer_dir, archive)
+            try:
+                container.exec_run(
+                    ["bash", "-lc", f"mkdir -p {shlex.quote(str(Path(path).parent))} && cp {transfer_dir}/undo.txt {shlex.quote(path)}"]
+                )
+            finally:
+                container.exec_run(["rm", "-rf", transfer_dir])
+            return FileEditorObservation.from_text(
+                f"Last edit to {path} undone successfully.",
+                command="undo_edit",
+                path=path,
+                old_content=old_content,
+                new_content=content,
+            )
+
+        def __call__(
+            self,
+            action: FileEditorAction,
+            conversation: Any | None = None,  # noqa: ARG002
+        ) -> FileEditorObservation:
+            if action.command == "undo_edit":
+                stack = self.history.get(action.path) or []
+                if not stack:
+                    return FileEditorObservation.from_text(
+                        f"No edit history available for {action.path}.",
+                        command=action.command,
+                        path=action.path,
+                        is_error=True,
+                    )
+                return self._write_undo_content(action.path, stack.pop())
+
+            payload = action.model_dump()
+            result = self._run_script(payload)
+            if not result.get("ok"):
+                return FileEditorObservation.from_text(
+                    str(result.get("message", "file editor failed")),
+                    command=action.command,
+                    path=result.get("path") or action.path,
+                    is_error=True,
+                )
+
+            old_content = result.get("old_content")
+            if action.command in {"create", "str_replace", "insert"}:
+                self.history.setdefault(action.path, []).append(old_content)
+
+            return FileEditorObservation.from_text(
+                str(result.get("message", "")),
+                command=action.command,
+                path=result.get("path") or action.path,
+                prev_exist=bool(result.get("prev_exist", True)),
+                old_content=old_content,
+                new_content=result.get("new_content"),
+            )
+
+    class SandboxFileEditorTool(ToolDefinition[FileEditorAction, FileEditorObservation]):
+        name: ClassVar[str] = "file_editor"
+
+        def declared_resources(self, action: Action) -> DeclaredResources:
+            assert isinstance(action, FileEditorAction)
+            return DeclaredResources(keys=(f"file:{action.path}",), declared=True)
+
+        @classmethod
+        def create(cls, conv_state: Any, **params: Any) -> list["SandboxFileEditorTool"]:  # noqa: ARG003
+            description = (
+                TOOL_DESCRIPTION
+                + "\n\nThis file editor is proxied into the isolated FeatureBench sandbox. "
+                + "All paths must be absolute and resolve under /testbed."
+                + "\n\nYour current working directory is: /testbed\n"
+                + "When exploring project structure, start with this directory instead of the root filesystem."
+            )
+            return [
+                cls(
+                    action_type=FileEditorAction,
+                    observation_type=FileEditorObservation,
+                    description=description,
+                    annotations=ToolAnnotations(
+                        title="file_editor",
+                        readOnlyHint=False,
+                        destructiveHint=True,
+                        idempotentHint=False,
+                        openWorldHint=False,
+                    ),
+                    executor=SandboxFileEditorExecutor(),
+                )
+            ]
+
+    register_tool("terminal", SandboxTerminalTool)
+    register_tool("file_editor", SandboxFileEditorTool)
+
+
 def _build_agent(llm: Any) -> Any:
     from openhands.sdk import Agent
-    from openhands.tools.preset.default import get_default_tools
+    from openhands.sdk.tool import Tool
+    from openhands.tools.task_tracker import TaskTrackerTool
 
-    tools = get_default_tools(enable_browser=False)
+    _register_sandbox_tools()
+    tools = [
+        Tool(name="terminal"),
+        Tool(name="file_editor"),
+        Tool(name=TaskTrackerTool.name),
+    ]
     return Agent(
         llm=llm,
         tools=tools,
@@ -928,7 +1435,6 @@ echo 'export LLM_LOG_COMPLETIONS_FOLDER=/agent-logs/completions' >> ~/.bashrc
 
         return (
             "set -o pipefail; "
-            "export SANDBOX_VOLUMES=${PWD}:/workspace:rw; "
             "if [ ! -x /opt/openhands-venv/bin/python ]; then "
             "echo '/opt/openhands-venv/bin/python not found' >&2; exit 127; "
             "fi; "
@@ -957,6 +1463,75 @@ echo 'export LLM_LOG_COMPLETIONS_FOLDER=/agent-logs/completions' >> ~/.bashrc
             "exit 1; "
             "fi"
         )
+
+    def run_with_sandbox(
+        self,
+        controller_container,
+        sandbox_container,
+        instruction: str,
+        log_file,
+        timeout: Optional[int] = None,
+    ) -> bool:
+        """Run OpenHands in the controller while tools execute in the sandbox."""
+        self.logger.info(
+            "Running OpenHands controller %s against sandbox %s",
+            getattr(controller_container, "short_id", "<unknown>"),
+            getattr(sandbox_container, "short_id", "<unknown>"),
+        )
+
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write("\n" + "=" * 60 + "\n")
+            f.write(f"BEGIN Agent Execution: {self.name}\n")
+            f.write("=" * 60 + "\n\n")
+            f.write(f"Instruction:\n{instruction}\n\n")
+            f.write("-" * 60 + "\n\n")
+
+        try:
+            if not self.pre_run_hook(controller_container, log_file):
+                raise RuntimeError("Pre-run hook failed")
+            if not self.prepare_run(controller_container, instruction, log_file):
+                raise RuntimeError("Run preparation failed")
+
+            run_command = self.get_run_command(instruction)
+            full_command = (
+                "source /installed-agent/setup-env.sh && "
+                "mkdir -p /agent-logs/workspace && "
+                "cd /agent-logs/workspace && "
+                f"{run_command}"
+            )
+            exit_code = self.cm.exec_command_stream(
+                controller_container,
+                full_command,
+                log_file=log_file,
+                timeout=timeout,
+            )
+            success_run = exit_code == 0
+            success_post_run = self.post_run_hook(controller_container, log_file)
+
+            if success_run and success_post_run:
+                self.logger.info("OpenHands completed successfully")
+                return True
+
+            if not success_run:
+                if self._force_timeout_enabled() and self._infer_log_has_timeout_marker(log_file):
+                    return True
+                raise RuntimeError(f"Agent execution failed with code {exit_code}")
+
+            raise RuntimeError("Post-run hook failed. Agent execution may not be successful.")
+        except Exception as e:
+            self.logger.error(f"Agent execution failed: {e}")
+            try:
+                self.failure_hook(controller_container, log_file)
+            except Exception as hook_error:
+                self.logger.warning(f"Failure hook error for {self.name}: {hook_error}")
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"\nERROR: {e}\n")
+            return False
+        finally:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write("\n" + "=" * 60 + "\n")
+                f.write(f"END Agent Execution: {self.name}\n")
+                f.write("=" * 60 + "\n\n")
     
     def get_env_setup_script(self) -> str:
         """Get environment setup script for OpenHands."""
@@ -1001,6 +1576,9 @@ echo 'export LLM_LOG_COMPLETIONS_FOLDER=/agent-logs/completions' >> ~/.bashrc
             "SKIP_DEPENDENCY_CHECK": "1",
             # Save trajectory
             "SAVE_TRAJECTORY_PATH": "/agent-logs/trajectory.json",
+            # Dual-container sandbox proxy settings.
+            "SANDBOX_CONTAINER_ID": self.env_vars.get("SANDBOX_CONTAINER_ID"),
+            "SANDBOX_WORKSPACE": self.env_vars.get("SANDBOX_WORKSPACE") or "/testbed",
             # Run without creating new user
             "RUN_AS_OPENHANDS": "false",
             # Use local runtime (we're inside the container)

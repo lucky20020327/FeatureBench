@@ -125,6 +125,7 @@ class ContainerManager:
         labels: Optional[Dict[str, str]] = None,
         volumes: Optional[Dict[str, Dict]] = None,
         use_host_network: bool = False,
+        network_mode: Optional[str] = None,
         proxy_port: Optional[int] = None,
         gpu_ids: Optional[str] = None,
         docker_runtime_config: Optional[Dict[str, Any]] = None
@@ -140,6 +141,7 @@ class ContainerManager:
             labels: Docker labels to attach to the container
             volumes: Volume mounts
             use_host_network: Whether to use host network mode (default: False, if proxy_port is not None, use host network)
+            network_mode: Explicit Docker network mode. If provided, overrides use_host_network.
             proxy_port: Proxy port to use for inference (default: None)
             gpu_ids: Comma-separated GPU IDs (e.g., "0,1,2,3"), None means all GPUs
             docker_runtime_config: Runtime config from repo_settings (need_gpu, shm_size, env_vars, env_exports, number_once)
@@ -184,6 +186,7 @@ class ContainerManager:
             self.logger.info(f"Using proxy port {proxy_port} via Docker host gateway ({DOCKER_HOST_GATEWAY})")
             # Keep bridge mode for port isolation (don't set use_host_network = True)
             use_host_network = False
+            network_mode = network_mode or "bridge"
             env_list.append(f"http_proxy=http://{DOCKER_HOST_GATEWAY}:{proxy_port}")
             env_list.append(f"https_proxy=http://{DOCKER_HOST_GATEWAY}:{proxy_port}")
             env_list.append(f"HTTP_PROXY=http://{DOCKER_HOST_GATEWAY}:{proxy_port}")
@@ -223,6 +226,8 @@ class ContainerManager:
 
         if shm_size:
             self.logger.info(f"Using shared memory size: {shm_size}")
+
+        effective_network_mode = network_mode or ("host" if use_host_network else "bridge")
         
         # Remove existing container with the same name if it exists
         if container_name:
@@ -254,7 +259,7 @@ class ContainerManager:
                 "volumes": volumes,
                 "user": "root",
                 "command": "tail -f /dev/null",  # Keep container running
-                "network_mode": "host" if use_host_network else "bridge",
+                "network_mode": effective_network_mode,
                 "device_requests": device_requests,
                 "shm_size": shm_size,
                 "labels": labels,
@@ -281,7 +286,7 @@ class ContainerManager:
                 else:
                     raise RuntimeError(f"This task needs GPU, but failed to query GPUs: {output.decode()}")
             
-            self.logger.info(f"Created container {container.short_id} (network: {'host' if use_host_network else 'bridge'})")
+            self.logger.info(f"Created container {container.short_id} (network: {effective_network_mode})")
             
             # Apply -ee environment exports (write to .bashrc) if any
             env_exports = docker_runtime_config.get("env_exports", [])
@@ -644,6 +649,37 @@ class ContainerManager:
         except Exception as e:
             self.logger.warning(f"Failed to copy {src_path} from container: {e}")
             return False
+
+    def disconnect_container_networks(self, container: Container) -> None:
+        """Best-effort network isolation for an already-initialized container."""
+        try:
+            container.reload()
+            networks = (
+                container.attrs.get("NetworkSettings", {})
+                .get("Networks", {})
+            )
+            for network_name in list(networks):
+                try:
+                    network = self.client.networks.get(network_name)
+                    network.disconnect(container, force=True)
+                    self.logger.info(
+                        "Disconnected container %s from network %s",
+                        container.short_id,
+                        network_name,
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        "Failed to disconnect container %s from network %s: %s",
+                        container.short_id,
+                        network_name,
+                        e,
+                    )
+        except Exception as e:
+            self.logger.warning(
+                "Failed to inspect networks for container %s: %s",
+                getattr(container, "short_id", "<unknown>"),
+                e,
+            )
 
     def stop_container(self, container: Container, force: bool = False) -> None:
         """
