@@ -255,6 +255,145 @@ def _event_to_trajectory_record(index: int, event: Any) -> dict[str, Any]:
     }
 
 
+def _to_jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_jsonable(item) for item in value]
+    try:
+        return value.model_dump(mode="json", exclude_none=True)
+    except Exception:
+        pass
+    try:
+        return dict(value)
+    except Exception:
+        return repr(value)
+
+
+def _as_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _mapping_from_obj(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    try:
+        dumped = value.model_dump(mode="json", exclude_none=True)
+        if isinstance(dumped, dict):
+            return dumped
+    except Exception:
+        pass
+    try:
+        converted = dict(value)
+        if isinstance(converted, dict):
+            return converted
+    except Exception:
+        pass
+    return None
+
+
+def _extract_usage_from_mapping(value: dict[str, Any]) -> dict[str, int] | None:
+    usage = value.get("accumulated_token_usage")
+    if not isinstance(usage, dict):
+        usage = value
+
+    prompt_tokens = (
+        _as_int(usage.get("prompt_tokens"))
+        or _as_int(usage.get("input_tokens"))
+        or _as_int(usage.get("cache_read_input_tokens"))
+    )
+    completion_tokens = (
+        _as_int(usage.get("completion_tokens"))
+        or _as_int(usage.get("output_tokens"))
+    )
+    total_tokens = (
+        _as_int(usage.get("total_tokens"))
+        or _as_int(usage.get("total"))
+        or prompt_tokens + completion_tokens
+    )
+
+    if not (prompt_tokens or completion_tokens or total_tokens):
+        return None
+
+    result = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+    }
+    if total_tokens:
+        result["total_tokens"] = total_tokens
+    return result
+
+
+def _extract_metrics_from_obj(value: Any, seen: set[int] | None = None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if seen is None:
+        seen = set()
+    obj_id = id(value)
+    if obj_id in seen:
+        return None
+    seen.add(obj_id)
+
+    mapping = _mapping_from_obj(value)
+    if isinstance(mapping, dict):
+        usage = _extract_usage_from_mapping(mapping)
+        if usage:
+            return {"accumulated_token_usage": usage}
+        for key in (
+            "metrics",
+            "llm_metrics",
+            "usage",
+            "token_usage",
+            "accumulated_token_usage",
+        ):
+            nested = mapping.get(key)
+            nested_metrics = _extract_metrics_from_obj(nested, seen)
+            if nested_metrics:
+                return nested_metrics
+
+    for attr in (
+        "metrics",
+        "llm_metrics",
+        "usage",
+        "token_usage",
+        "accumulated_token_usage",
+        "state",
+        "llm",
+    ):
+        try:
+            nested = getattr(value, attr)
+        except Exception:
+            continue
+        nested_metrics = _extract_metrics_from_obj(nested, seen)
+        if nested_metrics:
+            return nested_metrics
+
+    return None
+
+
+def _extract_llm_metrics(*objects: Any) -> dict[str, Any] | None:
+    for obj in objects:
+        metrics = _extract_metrics_from_obj(obj)
+        if metrics:
+            return _to_jsonable(metrics)
+    return None
+
+
 def _text_preview(value: Any, max_chars: int = 2000) -> str:
     if value is None:
         return ""
@@ -353,7 +492,12 @@ def _print_live_event(index: int, event: Any) -> None:
         )
 
 
-def _write_trajectory(path: Path, events: list[Any], status: str) -> None:
+def _write_trajectory(
+    path: Path,
+    events: list[Any],
+    status: str,
+    llm_metrics: dict[str, Any] | None = None,
+) -> None:
     trajectory = [
         _event_to_trajectory_record(index, event) for index, event in enumerate(events)
     ]
@@ -379,6 +523,9 @@ def _write_trajectory(path: Path, events: list[Any], status: str) -> None:
                 "args": {"status": status},
             }
         )
+
+    if llm_metrics:
+        trajectory[-1]["llm_metrics"] = llm_metrics
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(trajectory, indent=2), encoding="utf-8")
@@ -515,7 +662,8 @@ def main() -> int:
 
         status = getattr(conversation.state.execution_status, "value", None)
         status = str(status or conversation.state.execution_status).lower()
-        _write_trajectory(trajectory_path, events, status)
+        llm_metrics = _extract_llm_metrics(conversation, conversation.state, llm, agent)
+        _write_trajectory(trajectory_path, events, status, llm_metrics)
 
         if _has_error_code(events, "MaxIterationsReached"):
             print("RuntimeError: Agent reached maximum iteration.")
@@ -527,7 +675,7 @@ def main() -> int:
     except Exception:
         traceback.print_exc()
         try:
-            _write_trajectory(trajectory_path, events, "error")
+            _write_trajectory(trajectory_path, events, "error", _extract_llm_metrics(llm))
         except Exception:
             pass
         return 1
