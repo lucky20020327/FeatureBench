@@ -168,6 +168,8 @@ class InferConfig:
     without_interface_descriptions: bool = False
     # If True, enable white-box mode: agent can see FAIL_TO_PASS test file(s).
     white_box: bool = False
+    # Optional directory containing per-instance prompt/request override markdown files.
+    request_overrides_dir: Optional[str] = None
     # OpenHands only: True/False forces LLM_NATIVE_TOOL_CALLING, None leaves OpenHands default.
     native_tool_calling: Optional[bool] = None
     # If True, send prior assistant reasoning content back to OpenHands LLM requests.
@@ -204,6 +206,7 @@ class InferConfig:
             "split": self.split,
             "without_interface_descriptions": self.without_interface_descriptions,
             "white_box": self.white_box,
+            "request_overrides_dir": self.request_overrides_dir,
             "native_tool_calling": self.native_tool_calling,
             "send_reasoning_content": self.send_reasoning_content,
             "litellm_extra_body": self.litellm_extra_body,
@@ -268,6 +271,7 @@ class RunMetadata:
     level: Optional[List[int]] = None  # Level filter (1, 2)
     without_interface_descriptions: bool = False
     white_box: bool = False
+    request_overrides_dir: Optional[str] = None
     native_tool_calling: Optional[bool] = None
     send_reasoning_content: bool = False
     litellm_extra_body: Optional[str] = None
@@ -300,6 +304,7 @@ class RunMetadata:
             "level": self.level,
             "without_interface_descriptions": self.without_interface_descriptions,
             "white_box": self.white_box,
+            "request_overrides_dir": self.request_overrides_dir,
             "native_tool_calling": self.native_tool_calling,
             "send_reasoning_content": self.send_reasoning_content,
             "litellm_extra_body": self.litellm_extra_body,

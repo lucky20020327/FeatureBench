@@ -13,6 +13,7 @@ import argparse
 import atexit
 import json
 import logging
+import os
 import re
 import signal
 import sys
@@ -118,6 +119,30 @@ def _strip_interface_descriptions(problem_statement: str) -> str:
     cut_idx = match.start()
     kept = problem_statement[:cut_idx]
     return kept.rstrip() + "\n"
+
+
+def _safe_override_name(instance_id: str) -> str:
+    """Return a filesystem-safe fallback name for an instance override file."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", instance_id).strip("_") or "instance"
+
+
+def _request_override_candidates(overrides_dir: Path, instance_id: str) -> List[Path]:
+    return [
+        overrides_dir / f"{instance_id}.md",
+        overrides_dir / f"{_safe_override_name(instance_id)}.md",
+    ]
+
+
+def _read_request_override(overrides_dir: Path, instance_id: str) -> Optional[str]:
+    """Read a per-instance prompt/request override if one exists."""
+    seen: Set[Path] = set()
+    for path in _request_override_candidates(overrides_dir, instance_id):
+        if path in seen:
+            continue
+        seen.add(path)
+        if path.is_file():
+            return path.read_text(encoding="utf-8")
+    return None
 
 
 def _normalize_f2p_test_path(test_path: str) -> str:
@@ -694,6 +719,42 @@ class InferenceRunner:
         
         # Convert to TaskInstance objects
         instances = [TaskInstance.from_dict(item) for item in raw_data]
+        overrides_dir_value = getattr(self.config, "request_overrides_dir", None)
+        if overrides_dir_value:
+            overrides_dir = Path(overrides_dir_value).expanduser().resolve()
+            if not overrides_dir.is_dir():
+                raise FileNotFoundError(
+                    f"Request overrides directory not found: {overrides_dir}"
+                )
+            overridden = 0
+            missing: List[str] = []
+            for instance in instances:
+                override = _read_request_override(overrides_dir, instance.instance_id)
+                if override is None:
+                    missing.append(instance.instance_id)
+                    continue
+                instance.problem_statement = override
+                instance.metadata["problem_statement"] = override
+                instance.metadata["request_override_path"] = str(
+                    next(
+                        path
+                        for path in _request_override_candidates(
+                            overrides_dir,
+                            instance.instance_id,
+                        )
+                        if path.is_file()
+                    )
+                )
+                overridden += 1
+            if missing:
+                sample = ", ".join(missing[:5])
+                extra = "" if len(missing) <= 5 else f", ... ({len(missing)} total)"
+                raise FileNotFoundError(
+                    f"Missing request override file(s) in {overrides_dir}: {sample}{extra}"
+                )
+            self.console.print(
+                f"[yellow]Applied request overrides:[/] [green]{overridden}[/]"
+            )
         
         self.console.print(f"[green]Loaded {len(instances)} task instances[/]")
         return instances
@@ -742,6 +803,10 @@ class InferenceRunner:
             f.write("=" * 60 + "\n\n")
         
         container = None
+        sandbox_container = None
+        controller_container = None
+        cm = None
+        controller_cm = None
         gpu_lease: Optional[GpuLease] = None
         result = InferResult(
             instance_id=task_id,
@@ -798,8 +863,15 @@ class InferenceRunner:
                     f"OpenHands session cache enabled: session_id={session_id}"
                 )
 
+            use_dual_container_openhands = self.config.agent == "openhands"
+
             # Create container manager with task-specific logger/env.
-            cm = ContainerManager(task_logger, task_agent_env_vars)
+            # The sandbox deliberately does not receive LLM/API environment
+            # variables; those are only needed in the controller container.
+            cm = ContainerManager(
+                task_logger,
+                {} if use_dual_container_openhands else task_agent_env_vars,
+            )
             
             # Pull image if needed
             task_logger.info(f"Ensuring image {image_name} is available...")
@@ -821,51 +893,129 @@ class InferenceRunner:
                     self.cache_dir.mkdir(parents=True, exist_ok=True)
                 except Exception:
                     pass
-                # Bind host cache directory to /download inside container
-                volumes = {str(self.cache_dir): {"bind": "/download", "mode": "rw"}}
+                # Bind host cache directory to /download inside the agent
+                # controller only. The task sandbox should not see package
+                # caches that may contain reference source trees.
+                if not use_dual_container_openhands:
+                    volumes = {str(self.cache_dir): {"bind": "/download", "mode": "rw"}}
             
-            container = cm.create_container(
+            sandbox_container = cm.create_container(
                 image_name=image_name,
                 container_name=container_name,
                 working_dir="/testbed",
-                extra_env=container_extra_env,
+                extra_env=None if use_dual_container_openhands else container_extra_env,
                 labels=self._container_labels(task_id, attempt),
                 proxy_port=self.config.proxy_port,
                 gpu_ids=task_gpu_ids,
                 docker_runtime_config=docker_runtime_config,
                 volumes=volumes
             )
-            self._register_container(container)
+            container = sandbox_container
+            self._register_container(sandbox_container)
+
+            if use_dual_container_openhands:
+                controller_cm = ContainerManager(task_logger, task_agent_env_vars)
+                controller_volumes = {}
+                if self.cache_dir:
+                    controller_volumes[str(self.cache_dir)] = {
+                        "bind": "/download",
+                        "mode": "rw",
+                    }
+                # Bind-mount the Docker socket into the controller so the
+                # sandbox proxy tools can drive the daemon. The mount SOURCE is
+                # resolved by the daemon in its own filesystem context, not on
+                # the client host: on native Linux / Docker Desktop and on VM
+                # backends like colima the daemon always exposes the socket at
+                # /var/run/docker.sock, so we use that canonical path rather than
+                # the (possibly forwarded) client-side DOCKER_HOST path.
+                docker_sock_source = os.environ.get(
+                    "FB_DOCKER_SOCK_SOURCE", "/var/run/docker.sock"
+                )
+                controller_volumes[docker_sock_source] = {
+                    "bind": "/var/run/docker.sock",
+                    "mode": "rw",
+                }
+
+                task_agent_env_vars["SANDBOX_CONTAINER_ID"] = sandbox_container.id
+                task_agent_env_vars["SANDBOX_WORKSPACE"] = "/testbed"
+                controller_name = f"{container_name}-controller"
+                task_logger.info(
+                    "Creating OpenHands controller container %s for sandbox %s...",
+                    controller_name,
+                    sandbox_container.short_id,
+                )
+                controller_container = controller_cm.create_container(
+                    image_name=image_name,
+                    container_name=controller_name,
+                    working_dir="/agent-logs/workspace",
+                    extra_env={
+                        **(container_extra_env or {}),
+                        "SANDBOX_CONTAINER_ID": sandbox_container.id,
+                        "SANDBOX_WORKSPACE": "/testbed",
+                        # The host socket is always bind-mounted to the canonical
+                        # path inside the controller, so point the docker client
+                        # there regardless of the host DOCKER_HOST value.
+                        "DOCKER_HOST": "unix:///var/run/docker.sock",
+                    },
+                    labels=self._container_labels(task_id, attempt, purpose="controller"),
+                    proxy_port=self.config.proxy_port,
+                    gpu_ids=None,
+                    docker_runtime_config={},
+                    volumes=controller_volumes or None,
+                )
+                self._register_container(controller_container)
+                controller_cm.exec_command(
+                    controller_container,
+                    "rm -rf /testbed /root/my_repo && mkdir -p /agent-logs/workspace",
+                    log_file=log_file,
+                )
             
             # Initialize runtime with task-specific logger
             runtime_handler = RuntimeHandler(cm, task_logger)
             
             if not runtime_handler.initialize_runtime(
-                container,
+                sandbox_container,
                 instance,
                 log_file,
                 white_box=getattr(self.config, "white_box", False),
             ):
                 result.error = "Runtime initialization failed"
                 return result
+
+            disable_sandbox_network = (
+                str(task_agent_env_vars.get("FB_SANDBOX_DISABLE_NETWORK_AFTER_INIT", "true"))
+                .strip()
+                .lower()
+                in {"1", "true", "yes", "on"}
+            )
+            if use_dual_container_openhands and disable_sandbox_network:
+                task_logger.info(
+                    "Disconnecting sandbox container %s from Docker networks after initialization",
+                    sandbox_container.short_id,
+                )
+                cm.disconnect_container_networks(sandbox_container)
             
             # Create and install agent with task-specific logger
+            agent_cm = controller_cm if use_dual_container_openhands else cm
+            agent_container = controller_container if use_dual_container_openhands else sandbox_container
+            assert agent_cm is not None
+            assert agent_container is not None
             agent = get_agent(
                 self.config.agent,
-                container_manager=cm,
+                container_manager=agent_cm,
                 env_vars=task_agent_env_vars,
                 logger=task_logger,
                 model=self.config.model,
                 version=self.config.version,
             )
             
-            if not agent.install(container, log_file):
+            if not agent.install(agent_container, log_file):
                 result.error = "Agent installation failed"
                 return result
             
             # Pre-run setup hook (for custom container processing)
             task_logger.info("Running pre-run setup...")
-            if not agent.pre_run_setup(container, instance, log_file):
+            if not agent.pre_run_setup(agent_container, instance, log_file):
                 task_logger.warning("Pre-run setup returned False (non-fatal)")
             
             # Run agent
@@ -876,12 +1026,21 @@ class InferenceRunner:
                     instruction = _inject_white_box_note(instruction, f2p_path)
             if getattr(self.config, "without_interface_descriptions", False):
                 instruction = _strip_interface_descriptions(instruction)
-            agent_success = agent.run(
-                container,
-                instruction,
-                log_file,
-                timeout=self.config.timeout
-            )
+            if use_dual_container_openhands:
+                agent_success = agent.run_with_sandbox(
+                    agent_container,
+                    sandbox_container,
+                    instruction,
+                    log_file,
+                    timeout=self.config.timeout,
+                )
+            else:
+                agent_success = agent.run(
+                    sandbox_container,
+                    instruction,
+                    log_file,
+                    timeout=self.config.timeout,
+                )
             
             # if not agent_success, raise an exception and try to save patch
             if not agent_success:
@@ -889,7 +1048,7 @@ class InferenceRunner:
                 task_logger.warning(
                     f"{self.config.agent} did not complete successfully; attempting to generate patch"
                 )
-                patch = runtime_handler.complete_runtime(container, instance, log_file)
+                patch = runtime_handler.complete_runtime(sandbox_container, instance, log_file)
 
                 if patch is None:
                     raise RuntimeError(
@@ -904,7 +1063,7 @@ class InferenceRunner:
                 raise RuntimeError(f"Agent did not complete successfully")
             
             # Complete runtime and get patch
-            patch = runtime_handler.complete_runtime(container, instance, log_file)
+            patch = runtime_handler.complete_runtime(sandbox_container, instance, log_file)
             
             if patch is None:
                 result.error = "Failed to generate patch"
@@ -928,14 +1087,23 @@ class InferenceRunner:
             # Remove from live running-task display as soon as task completes.
             self._mark_task_finished(task_id, attempt)
 
-            # Clean up container
-            if container is not None:
+            # Clean up containers. In dual-container OpenHands runs, stop the
+            # controller first so no proxy tool can issue more sandbox commands.
+            if controller_container is not None and controller_cm is not None:
                 try:
-                    cm.stop_container(container, force=True)
+                    controller_cm.stop_container(controller_container, force=True)
                 except Exception as e:
-                    task_logger.warning(f"Error cleaning up container: {e}")
+                    task_logger.warning(f"Error cleaning up controller container: {e}")
                 finally:
-                    self._unregister_container(container)
+                    self._unregister_container(controller_container)
+
+            if sandbox_container is not None and cm is not None:
+                try:
+                    cm.stop_container(sandbox_container, force=True)
+                except Exception as e:
+                    task_logger.warning(f"Error cleaning up sandbox container: {e}")
+                finally:
+                    self._unregister_container(sandbox_container)
 
             # Release GPU lease even if container creation failed.
             if gpu_lease is not None and self._gpu_scheduler is not None:
@@ -1089,6 +1257,7 @@ class InferenceRunner:
             level=self.config.level,
             without_interface_descriptions=self.config.without_interface_descriptions,
             white_box=getattr(self.config, "white_box", False),
+            request_overrides_dir=getattr(self.config, "request_overrides_dir", None),
             native_tool_calling=native_tool_calling,
             send_reasoning_content=send_reasoning_content,
             litellm_extra_body=litellm_extra_body,
@@ -1131,6 +1300,10 @@ class InferenceRunner:
             self.console.print("[white]Prompt:[/] [yellow]without interface descriptions[/]")
         if getattr(self.config, "white_box", False):
             self.console.print("[white]Prompt:[/] [yellow]white-box (tests visible)[/]")
+        if getattr(self.config, "request_overrides_dir", None):
+            self.console.print(
+                f"[white]Request overrides:[/] [yellow]{self.config.request_overrides_dir}[/]"
+            )
         if self.config.agent == "openhands":
             native_tool_calling = self.agent_env_vars.get("LLM_NATIVE_TOOL_CALLING")
             native_tool_calling = (
@@ -1571,6 +1744,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--request-overrides-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory containing per-instance .md files that replace the loaded "
+            "problem_statement before the agent is run. Files are matched by "
+            "<instance_id>.md or a filesystem-safe instance id. In --resume mode, "
+            "this argument is ignored (uses run_metadata.json)."
+        ),
+    )
+
     native_tool_group = parser.add_mutually_exclusive_group()
     native_tool_group.add_argument(
         "--native-tool-calling",
@@ -1728,6 +1913,10 @@ def load_resume_config(resume_dir: Path, args: argparse.Namespace) -> Tuple[Infe
         warnings.append(
             "--white (using 'white_box' from metadata)"
         )
+    if args.request_overrides_dir is not None:
+        warnings.append(
+            "--request-overrides-dir (using 'request_overrides_dir' from metadata)"
+        )
     if getattr(args, "native_tool_calling", False):
         warnings.append(
             "--native-tool-calling (using 'native_tool_calling' from metadata)"
@@ -1811,6 +2000,9 @@ def load_resume_config(resume_dir: Path, args: argparse.Namespace) -> Tuple[Infe
     # Determine white_box: always use metadata in resume mode.
     white_box = bool(metadata.get("white_box"))
 
+    # Determine request_overrides_dir: always use metadata in resume mode.
+    request_overrides_dir = metadata.get("request_overrides_dir")
+
     # Determine native_tool_calling: always use metadata in resume mode.
     native_tool_calling = metadata.get("native_tool_calling")
 
@@ -1849,6 +2041,7 @@ def load_resume_config(resume_dir: Path, args: argparse.Namespace) -> Tuple[Infe
         split=metadata.get('split'),  # Use split from metadata
         without_interface_descriptions=without_interface_descriptions,
         white_box=white_box,
+        request_overrides_dir=request_overrides_dir,
         native_tool_calling=native_tool_calling,
         send_reasoning_content=send_reasoning_content,
         litellm_extra_body=litellm_extra_body,
@@ -1920,6 +2113,7 @@ def main() -> int:
             split=args.split if args.split is not None else "full",
             without_interface_descriptions=bool(getattr(args, "without", False)),
             white_box=bool(getattr(args, "white", False)),
+            request_overrides_dir=args.request_overrides_dir,
             native_tool_calling=(
                 True
                 if getattr(args, "native_tool_calling", False)
