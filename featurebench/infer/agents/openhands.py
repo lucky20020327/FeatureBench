@@ -678,6 +678,53 @@ def _register_sandbox_tools() -> None:
                         "Command rejected by FeatureBench sandbox policy: "
                         f"access to {token.strip()} is not allowed."
                     )
+            anti_leakage_tokens = (
+                "/opt/miniconda3",
+                "/opt/conda",
+                "/usr/local/lib/python",
+                "/usr/lib/python",
+                "site-packages/pip/_vendor",
+                "site-packages/setuptools/_vendor",
+                "site-packages/wheel",
+                "pip/_vendor/",
+                "setuptools/_vendor/",
+                "wheel/vendored/",
+                "/conda/pkgs",
+                "/pkgs/",
+                "/download",
+                "pip download",
+                "python -m pip download",
+                "pip install --download",
+                "pip wheel",
+            )
+            for token in anti_leakage_tokens:
+                if token in lowered:
+                    return (
+                        "Command rejected by FeatureBench anti-leakage policy: "
+                        "do not access installed/vendored packages, package caches, "
+                        f"or source downloads ({token.strip()})."
+                    )
+            suspicious_patterns = (
+                "find / ",
+                "find /opt",
+                "find /usr",
+                "grep -r /opt",
+                "grep -r /usr",
+                "rg /opt",
+                "rg /usr",
+                "diff /opt",
+                "diff /usr",
+                "cp /opt",
+                "cp /usr",
+                "cat /opt",
+                "cat /usr",
+            )
+            for pattern in suspicious_patterns:
+                if pattern in lowered and "/testbed" not in lowered:
+                    return (
+                        "Command rejected by FeatureBench anti-leakage policy: "
+                        "commands that search/read/copy outside /testbed are not allowed."
+                    )
             return None
 
         def __call__(
@@ -1232,6 +1279,14 @@ def _release_backend_session(
 class OpenHandsAgent(BaseAgent):
     """OpenHands agent for FeatureBench inference."""
     SESSION_RELEASE_MARKER = "/agent-logs/session_release.done"
+    ANTI_LEAKAGE_INSTRUCTION = """\
+FeatureBench anti-leakage rules:
+- Solve the task using only the checked-out repository under /testbed and the task statement.
+- Do not search for, read, diff, copy, or use reference implementations outside /testbed.
+- Do not inspect installed packages, vendored packages, package caches, conda/pip caches, previous runs, hidden tests, gold patches, solution files, or source archives to obtain implementation code.
+- In particular, do not access /opt, /usr/local, site-packages, pip/_vendor, setuptools/_vendor, wheel vendored packages, /download, /tmp reference downloads, or internet source archives for implementation guidance.
+- Attempts to access those locations are considered evaluation leakage and will invalidate the run.
+"""
     
     @property
     def name(self) -> str:
@@ -1464,6 +1519,11 @@ echo 'export LLM_LOG_COMPLETIONS_FOLDER=/agent-logs/completions' >> ~/.bashrc
             "fi"
         )
 
+    def _with_anti_leakage_instruction(self, instruction: str) -> str:
+        if "FeatureBench anti-leakage rules:" in instruction:
+            return instruction
+        return f"{self.ANTI_LEAKAGE_INSTRUCTION}\n{instruction}"
+
     def run_with_sandbox(
         self,
         controller_container,
@@ -1473,6 +1533,7 @@ echo 'export LLM_LOG_COMPLETIONS_FOLDER=/agent-logs/completions' >> ~/.bashrc
         timeout: Optional[int] = None,
     ) -> bool:
         """Run OpenHands in the controller while tools execute in the sandbox."""
+        instruction = self._with_anti_leakage_instruction(instruction)
         self.logger.info(
             "Running OpenHands controller %s against sandbox %s",
             getattr(controller_container, "short_id", "<unknown>"),
